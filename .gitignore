@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment
+.env
+
+# Model directories (stored externally in bucket)
+whisper-large-v3-turbo-finetuned/
+whisper-large-v3-turbo/
+models/
+*.safetensors
+*.bin
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+*.pid
+*.log
+logs/
+
+# Docker
+.dockerignore
