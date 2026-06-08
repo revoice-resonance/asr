@@ -1,17 +1,14 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # =============================================================================
-# Model Packaging Script
+# Model Packaging Script — 把模型目录打成 tar.gz 准备上传 bucket
 # =============================================================================
-# Converts whisper-large-v3-turbo from HuggingFace format to CTranslate2,
-# then creates a tar.gz archive ready for upload to a bucket.
 #
-# Usage:
-#   bash package_model.sh                          # convert + package
-#   bash package_model.sh --skip-convert            # package existing ct2 model
-#   bash package_model.sh --output my-model.tar.gz  # custom output name
+# 用法:
+#   bash package_model.sh                           # 打包默认目录
+#   bash package_model.sh -d my-model-dir            # 指定模型目录
+#   bash package_model.sh -o my-model.tar.gz         # 指定输出文件名
 #
-# Prerequisites:
-#   pip install ctranslate2 transformers
+# 上传后把链接写入 MODEL_URL 文件，deploy.sh 会自动读取。
 # =============================================================================
 
 set -euo pipefail
@@ -21,18 +18,19 @@ cd "$SCRIPT_DIR"
 
 # --- Config -------------------------------------------------------------------
 
-HF_MODEL_DIR="${HF_MODEL_DIR:-whisper-large-v3-turbo-finetuned}"
-CT2_MODEL_DIR="${CT2_MODEL_DIR:-models/whisper-large-v3-turbo-ct2}"
-COMPUTE_TYPE="${COMPUTE_TYPE:-float16}"   # float16 | int8_float16 | int8
-OUTPUT="${OUTPUT:-whisper-large-v3-turbo-ct2.tar.gz}"
-SKIP_CONVERT=false
+MODEL_DIR="${MODEL_DIR:-whisper-large-v3-turbo-finetuned}"
+OUTPUT="${OUTPUT:-whisper-large-v3-turbo-finetuned.tar.gz}"
 
-# Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-convert) SKIP_CONVERT=true; shift ;;
-        --output) OUTPUT="$2"; shift 2 ;;
-        --compute-type) COMPUTE_TYPE="$2"; shift 2 ;;
+        -d|--dir)    MODEL_DIR="$2"; shift 2 ;;
+        -o|--output) OUTPUT="$2"; shift 2 ;;
+        -h|--help)
+            echo "Usage: bash package_model.sh [-d MODEL_DIR] [-o OUTPUT.tar.gz]"
+            echo ""
+            echo "  默认打包 whisper-large-v3-turbo-finetuned/ → whisper-large-v3-turbo-finetuned.tar.gz"
+            exit 0
+            ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -40,99 +38,56 @@ done
 # --- Helpers ------------------------------------------------------------------
 
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
 log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# --- Step 1: Convert HF → CTranslate2 -----------------------------------------
+# --- Check --------------------------------------------------------------------
 
-if $SKIP_CONVERT; then
-    log_info "Skipping conversion, using existing model at $CT2_MODEL_DIR"
-else
-    log_info "Converting $HF_MODEL_DIR → $CT2_MODEL_DIR (compute_type=$COMPUTE_TYPE)"
-
-    if [ ! -d "$HF_MODEL_DIR" ]; then
-        log_error "HuggingFace model not found at $HF_MODEL_DIR"
-        log_error "Place your fine-tuned model in $HF_MODEL_DIR/ or use --skip-convert"
-        exit 1
-    fi
-
-    if [ ! -f "$HF_MODEL_DIR/model.safetensors" ] && [ ! -f "$HF_MODEL_DIR/pytorch_model.bin" ]; then
-        log_error "No model weights found in $HF_MODEL_DIR/"
-        exit 1
-    fi
-
-    # Install converter if needed
-    pip install ctranslate2 transformers -q 2>/dev/null || {
-        log_error "Failed to install ctranslate2. Run: pip install ctranslate2 transformers"
-        exit 1
-    }
-
-    # Convert
-    log_info "Running ct2-transformers-converter..."
-    ct2-transformers-converter \
-        --model "$HF_MODEL_DIR" \
-        --output_dir "$CT2_MODEL_DIR" \
-        --copy_files tokenizer.json preprocessor_config.json \
-        --quantization "$COMPUTE_TYPE" \
-        --force
-
-    log_info "Conversion complete"
-fi
-
-# --- Step 2: Verify CTranslate2 model -----------------------------------------
-
-if [ ! -f "$CT2_MODEL_DIR/model.bin" ] && [ ! -f "$CT2_MODEL_DIR/config.json" ]; then
-    log_error "CTranslate2 model not found at $CT2_MODEL_DIR"
+if [ ! -d "$MODEL_DIR" ]; then
+    log_error "模型目录不存在: $MODEL_DIR"
     exit 1
 fi
 
-log_info "Model files:"
-find "$CT2_MODEL_DIR" -type f -exec ls -lh {} \; | awk '{print "  " $NF " (" $5 ")"}'
+FILE_COUNT=$(find "$MODEL_DIR" -type f | wc -l)
+DIR_SIZE=$(du -sh "$MODEL_DIR" | cut -f1)
+log_info "模型目录: $MODEL_DIR ($FILE_COUNT 个文件, $DIR_SIZE)"
 
-# --- Step 3: Create archive ---------------------------------------------------
+# --- Package ------------------------------------------------------------------
 
-log_info "Creating archive: $OUTPUT"
+PARENT_DIR="$(dirname "$MODEL_DIR")"
+MODEL_BASENAME="$(basename "$MODEL_DIR")"
 
-# Get the parent dir and basename for clean extraction paths
-PARENT_DIR="$(dirname "$CT2_MODEL_DIR")"
-MODEL_BASENAME="$(basename "$CT2_MODEL_DIR")"
-
+log_info "打包中..."
 tar -czf "$OUTPUT" -C "$PARENT_DIR" "$MODEL_BASENAME"
 
 ARCHIVE_SIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
-log_info "Archive created: $OUTPUT ($ARCHIVE_SIZE)"
+log_info "完成: $OUTPUT ($ARCHIVE_SIZE)"
 
-# --- Step 4: Print upload instructions ----------------------------------------
+# --- Instructions -------------------------------------------------------------
 
 echo ""
 echo "=============================================="
-echo "  Model package ready for upload"
+echo "  上传到 bucket 后，把链接写入 MODEL_URL 文件"
 echo "=============================================="
 echo ""
-echo "  Archive:  $(realpath "$OUTPUT")"
-echo "  Size:     $ARCHIVE_SIZE"
+echo "  当前目录: $(pwd)"
+echo "  压缩包:   $OUTPUT ($ARCHIVE_SIZE)"
 echo ""
-echo "  Upload to your bucket, then set in .env:"
-echo "    MODEL_DOWNLOAD_URL=https://your-bucket.example.com/$OUTPUT"
+echo "  上传示例:"
+echo "    # 阿里云 OSS (AutoDL 常用)"
+echo "    ossutil cp $OUTPUT oss://your-bucket/models/$OUTPUT"
 echo ""
-echo "  Example upload commands:"
 echo "    # AWS S3"
 echo "    aws s3 cp $OUTPUT s3://your-bucket/models/$OUTPUT"
 echo ""
-echo "    # Alibaba Cloud OSS (AutoDL常用)"
-echo "    ossutil cp $OUTPUT oss://your-bucket/models/$OUTPUT"
-echo ""
-echo "    # Google Cloud Storage"
-echo "    gsutil cp $OUTPUT gs://your-bucket/models/$OUTPUT"
-echo ""
-echo "    # rclone (any provider)"
+echo "    # rclone"
 echo "    rclone copy $OUTPUT remote:bucket/models/"
 echo ""
-echo "  On the server, deploy.sh will auto-download and extract:"
-echo "    bash deploy.sh start"
+echo "  上传后编辑 MODEL_URL 文件，写入下载地址:"
+echo "    echo 'https://your-bucket.example.com/models/$OUTPUT' > MODEL_URL"
+echo ""
+echo "  部署时 deploy.sh 会自动读取 MODEL_URL 下载模型。"
 echo "=============================================="
