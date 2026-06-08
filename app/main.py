@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import structlog
 from fastapi import FastAPI, Request

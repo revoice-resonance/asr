@@ -12,7 +12,6 @@ from slowapi.util import get_remote_address
 from app.config import settings
 from app.dependencies import verify_api_key
 from app.schemas.responses import (
-    ErrorDetail,
     ErrorResponse,
     TranscriptionResponse,
     TranscriptionSegment,
@@ -20,8 +19,8 @@ from app.schemas.responses import (
 )
 from app.services.audio import (
     cleanup_temp_file,
-    decode_audio_ffmpeg,
-    get_audio_duration,
+    decode_audio_ffmpeg_async,
+    get_audio_duration_async,
     save_upload_to_temp,
 )
 
@@ -75,8 +74,8 @@ async def transcribe(
     tmp_path = await save_upload_to_temp(file)
 
     try:
-        # Check audio duration
-        duration = get_audio_duration(tmp_path)
+        # Check audio duration (non-blocking via asyncio.to_thread)
+        duration = await get_audio_duration_async(tmp_path)
         if duration > settings.max_audio_duration:
             raise HTTPException(
                 status_code=400,
@@ -90,8 +89,8 @@ async def transcribe(
                 detail=f"Audio too short: {duration:.2f}s",
             )
 
-        # Decode to numpy array
-        audio = decode_audio_ffmpeg(tmp_path)
+        # Decode to numpy array (non-blocking via asyncio.to_thread)
+        audio = await decode_audio_ffmpeg_async(tmp_path)
 
         # Submit to GPU worker
         worker = request.app.state.worker

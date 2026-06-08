@@ -48,4 +48,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
 
 EXPOSE 8080
 
-CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run via module entry point to pick up .env / env var config
+# Override HOST/PORT via docker-compose environment or -e flags
+CMD ["python3", "-m", "app.main"]

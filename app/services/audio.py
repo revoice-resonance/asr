@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -205,12 +205,12 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
         if tmp_path.exists():
             tmp_path.unlink()
         raise
-    except Exception:
+    except Exception as e:
         if tmp_path.exists():
             tmp_path.unlink()
         raise HTTPException(
             status_code=500,
-            detail="Failed to save uploaded file",
+            detail=f"Failed to save uploaded file: {e}",
         )
 
     return tmp_path
@@ -222,3 +222,16 @@ def cleanup_temp_file(file_path: str | Path) -> None:
         Path(file_path).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+# --- Async wrappers (for use in async route handlers) ---
+
+
+async def decode_audio_ffmpeg_async(file_path: str | Path, sr: int = 16000) -> np.ndarray:
+    """Async wrapper around decode_audio_ffmpeg to avoid blocking the event loop."""
+    return await asyncio.to_thread(decode_audio_ffmpeg, file_path, sr)
+
+
+async def get_audio_duration_async(file_path: str | Path) -> float:
+    """Async wrapper around get_audio_duration to avoid blocking the event loop."""
+    return await asyncio.to_thread(get_audio_duration, file_path)

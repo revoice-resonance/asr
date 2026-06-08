@@ -1,0 +1,35 @@
+# Model directories (mounted as volumes, not copied into image)
+models/
+whisper-large-v3-turbo-finetuned/
+whisper-large-v3-turbo/
+*.safetensors
+*.bin
+
+# Virtual environment
+venv/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs
+logs/
+*.log
+*.pid
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# IDE
+.idea/
+.vscode/
