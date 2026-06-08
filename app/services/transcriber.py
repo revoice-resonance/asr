@@ -10,18 +10,18 @@ Single GPU worker pattern:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+import structlog
 import torch
 from faster_whisper import WhisperModel
 
 from app.config import settings
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -99,12 +99,15 @@ class TranscriptionWorker:
         """Gracefully stop the worker and clean up GPU resources."""
         self._running = False
 
-        # Cancel pending jobs
+        # Cancel pending jobs with explicit exception so callers get a
+        # proper error instead of hanging forever (C-1 fix).
         while not self._queue.empty():
             try:
                 job = self._queue.get_nowait()
                 if not job.future.done():
-                    job.future.cancel()
+                    job.future.set_exception(
+                        RuntimeError("Server is shutting down — please retry")
+                    )
             except asyncio.QueueEmpty:
                 break
 
@@ -144,7 +147,7 @@ class TranscriptionWorker:
             TranscriptionResult with text, language, duration, and segments.
 
         Raises:
-            RuntimeError: If the worker is not running.
+            RuntimeError: If the worker is not running or is shutting down.
             asyncio.TimeoutError: If the queue is full and timeout expires.
         """
         if not self._running:
@@ -162,8 +165,15 @@ class TranscriptionWorker:
                 "Try again later."
             )
 
-        # Wait for result
-        return await future
+        # Wait for result — translate CancelledError / shutdown RuntimeError
+        # into a proper error so the client gets a 503 instead of hanging (C-1).
+        try:
+            return await future
+        except asyncio.CancelledError:
+            raise RuntimeError("Server is shutting down — please retry")
+        except RuntimeError:
+            # Re-raise RuntimeError from shutdown so route can map to 503
+            raise
 
     # --- Properties ---
 
@@ -181,39 +191,53 @@ class TranscriptionWorker:
 
     async def _worker_loop(self) -> None:
         """Main worker loop: dequeue jobs, run inference, resolve futures."""
-        while self._running:
-            try:
-                # Wait for a job with a timeout so we can check _running
-                job = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+        try:
+            while self._running:
+                try:
+                    # Wait for a job with a timeout so we can check _running
+                    job = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
 
-            if job.future.done():
-                continue
+                if job.future.done():
+                    continue
 
-            try:
-                start = time.monotonic()
-                result = await self._transcribe(job.audio, job.language)
-                elapsed = time.monotonic() - start
+                try:
+                    start = time.monotonic()
+                    result = await self._transcribe(job.audio, job.language)
+                    elapsed = time.monotonic() - start
 
-                logger.info(
-                    "Transcription complete",
-                    language=result.language,
-                    duration=result.duration,
-                    elapsed=round(elapsed, 2),
-                    queue_depth=self._queue.qsize(),
-                )
+                    logger.info(
+                        "Transcription complete",
+                        language=result.language,
+                        duration=result.duration,
+                        elapsed=round(elapsed, 2),
+                        queue_depth=self._queue.qsize(),
+                    )
 
-                job.future.set_result(result)
+                    job.future.set_result(result)
 
-            except Exception as exc:
-                logger.error(
-                    "Transcription failed",
-                    error=str(exc),
-                    queue_depth=self._queue.qsize(),
-                )
-                if not job.future.done():
-                    job.future.set_exception(exc)
+                except Exception as exc:
+                    logger.error(
+                        "Transcription failed",
+                        error=str(exc),
+                        queue_depth=self._queue.qsize(),
+                    )
+                    if not job.future.done():
+                        job.future.set_exception(exc)
+        except asyncio.CancelledError:
+            # Worker is being stopped — drain remaining queued futures so
+            # callers don't hang (C-1).
+            while not self._queue.empty():
+                try:
+                    job = self._queue.get_nowait()
+                    if not job.future.done():
+                        job.future.set_exception(
+                            RuntimeError("Worker stopped — please retry")
+                        )
+                except asyncio.QueueEmpty:
+                    break
+            raise
 
     async def _transcribe(
         self,
@@ -243,7 +267,7 @@ class TranscriptionWorker:
             task="transcribe",
             beam_size=5,
             best_of=5,
-            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            temperature=[0.0, 0.2, 0.4],
             vad_filter=settings.vad_enabled,
             vad_parameters=dict(
                 threshold=settings.vad_threshold,

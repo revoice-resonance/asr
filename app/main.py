@@ -103,8 +103,9 @@ async def lifespan(app: FastAPI):
         port=settings.port,
         model_path=str(model_path),
         device=settings.model_device,
-        auth_enabled=settings.auth_enabled,
         rate_limit=f"{settings.rate_limit_rpm}/min" if settings.rate_limit_rpm > 0 else "disabled",
+        # B-8: Dump all effective settings for debugging config typos
+        effective_settings=settings.model_dump(),
     )
 
     yield
@@ -134,11 +135,11 @@ def create_app() -> FastAPI:
     # --- Middleware ---
     # Order matters: last added = outermost (executed first)
 
-    # CORS
+    # CORS — explicit origins only; W3C forbids allow_credentials=True with wildcard
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=settings.cors_origins_list,
+        allow_credentials=True if settings.cors_origins_list != ["*"] else False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -195,5 +196,4 @@ if __name__ == "__main__":
         port=settings.port,
         log_level=settings.log_level,
         reload=False,
-        workers=settings.workers,
     )

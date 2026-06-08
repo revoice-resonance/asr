@@ -143,37 +143,20 @@ check_prerequisites() {
 # --- ffmpeg Installation -------------------------------------------------------
 
 install_ffmpeg() {
-    # Already installed — check if it meets our needs
+    # Already installed — done
     if command -v ffmpeg &>/dev/null; then
-        if $HAS_NVIDIA && ! ffmpeg -codecs 2>/dev/null | grep -q h264_nvenc; then
-            log_warn "ffmpeg found but lacks NVIDIA GPU codecs. Attempting upgrade..."
-            # Fall through to install GPU-enabled version
-        else
-            log_info "ffmpeg already installed with required capabilities"
-            return 0
-        fi
-    else
-        log_warn "ffmpeg not found. Installing..."
-    fi
-
-    # Strategy 1: NVIDIA GPU → download BtbN static build with NVENC/NVDEC/CUDA
-    if $HAS_NVIDIA && install_ffmpeg_nvidia; then
+        log_info "ffmpeg already installed"
         return 0
     fi
 
-    # Strategy 2: conda (often ships GPU-enabled ffmpeg on CUDA machines)
-    if command -v conda &>/dev/null; then
-        log_info "Installing ffmpeg via conda-forge..."
-        if conda install -y -c conda-forge ffmpeg 2>/dev/null; then
-            if command -v ffmpeg &>/dev/null; then
-                log_info "ffmpeg installed via conda"
-                return 0
-            fi
-        fi
-        log_warn "conda install failed, trying next method..."
+    log_warn "ffmpeg not found. Installing..."
+
+    # NVIDIA GPU build (opt-in via INSTALL_FFMPEG_NVIDIA=1)
+    if [ "${INSTALL_FFMPEG_NVIDIA:-0}" = "1" ] && $HAS_NVIDIA; then
+        install_ffmpeg_nvidia && return 0
     fi
 
-    # Strategy 3: apt-get (standard Ubuntu ffmpeg, CPU-only but reliable)
+    # apt-get (standard, reliable)
     if command -v apt-get &>/dev/null; then
         log_info "Installing ffmpeg via apt-get..."
         if sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y -qq ffmpeg 2>/dev/null; then
@@ -182,12 +165,19 @@ install_ffmpeg() {
                 return 0
             fi
         fi
-        log_warn "apt-get install failed, trying next method..."
+        log_warn "apt-get install failed"
     fi
 
-    # Strategy 4: static CPU-only build (last resort, works anywhere)
-    if install_ffmpeg_static; then
-        return 0
+    # conda fallback
+    if command -v conda &>/dev/null; then
+        log_info "Installing ffmpeg via conda-forge..."
+        if conda install -y -c conda-forge ffmpeg 2>/dev/null; then
+            if command -v ffmpeg &>/dev/null; then
+                log_info "ffmpeg installed via conda"
+                return 0
+            fi
+        fi
+        log_warn "conda install failed"
     fi
 
     return 1
@@ -268,67 +258,6 @@ install_ffmpeg_nvidia() {
     fi
 
     log_warn "GPU ffmpeg installed but NVIDIA codecs not detected (driver mismatch?)"
-    return 1
-}
-
-install_ffmpeg_static() {
-    # Fallback: johnvansickle.com static build (CPU-only, works on any amd64 Linux)
-    local BASE_URL="https://johnvansickle.com/ffmpeg/releases"
-    local ARCHIVE="ffmpeg-release-amd64-static.tar.xz"
-    local TMP_DIR="/tmp/ffmpeg_static_$$"
-
-    log_info "Downloading static ffmpeg build (CPU-only)..."
-
-    mkdir -p "$TMP_DIR"
-
-    if command -v wget &>/dev/null; then
-        wget -q --show-progress -O "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
-            rm -rf "$TMP_DIR"
-            return 1
-        }
-    elif command -v curl &>/dev/null; then
-        curl -# -L -o "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
-            rm -rf "$TMP_DIR"
-            return 1
-        }
-    else
-        rm -rf "$TMP_DIR"
-        return 1
-    fi
-
-    tar -xf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR" 2>/dev/null || {
-        rm -rf "$TMP_DIR"
-        return 1
-    }
-
-    local EXTRACTED_DIR
-    EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d -name "ffmpeg-*-static" | head -1)
-    if [ -z "$EXTRACTED_DIR" ]; then
-        rm -rf "$TMP_DIR"
-        return 1
-    fi
-
-    local BIN_DIR
-    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
-        BIN_DIR="/usr/local/bin"
-        sudo cp "${EXTRACTED_DIR}/ffmpeg" "${EXTRACTED_DIR}/ffprobe" "$BIN_DIR/" 2>/dev/null || {
-            BIN_DIR="${HOME}/.local/bin"
-            mkdir -p "$BIN_DIR"
-            cp "${EXTRACTED_DIR}/ffmpeg" "${EXTRACTED_DIR}/ffprobe" "$BIN_DIR/"
-        }
-    else
-        BIN_DIR="${HOME}/.local/bin"
-        mkdir -p "$BIN_DIR"
-        cp "${EXTRACTED_DIR}/ffmpeg" "${EXTRACTED_DIR}/ffprobe" "$BIN_DIR/"
-        export PATH="${HOME}/.local/bin:${PATH}"
-    fi
-
-    rm -rf "$TMP_DIR"
-
-    if command -v ffmpeg &>/dev/null; then
-        log_info "Static ffmpeg installed to ${BIN_DIR}"
-        return 0
-    fi
     return 1
 }
 
@@ -515,8 +444,20 @@ start_server() {
     local pid=$!
     echo "$pid" > "$PID_FILE"
 
-    # Wait a moment and check if it's still running
-    sleep 3
+    # Poll /health/ready until model is loaded (up to 60s)
+    log_info "Waiting for model to load..."
+    local waited=0
+    local max_wait=60
+    while [ $waited -lt $max_wait ]; do
+        if command -v curl &>/dev/null; then
+            if curl -sf "http://${HOST}:${PORT}/health/ready" >/dev/null 2>&1; then
+                break
+            fi
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
     if kill -0 "$pid" 2>/dev/null; then
         log_info "Server started successfully (PID: $pid)"
         log_info "Listening on http://${HOST}:${PORT}"

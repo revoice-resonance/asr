@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+import structlog
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.config import settings
-from app.dependencies import verify_api_key
 from app.schemas.responses import (
     ErrorResponse,
     TranscriptionResponse,
@@ -24,7 +23,7 @@ from app.services.audio import (
     save_upload_to_temp,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["transcription"])
 
@@ -37,7 +36,6 @@ limiter = Limiter(key_func=get_remote_address)
     response_model=TranscriptionResponse | VerboseTranscriptionResponse,
     responses={
         400: {"model": ErrorResponse, "description": "Bad request"},
-        401: {"model": ErrorResponse, "description": "Unauthorized"},
         413: {"model": ErrorResponse, "description": "File too large"},
         429: {"model": ErrorResponse, "description": "Rate limited"},
         500: {"model": ErrorResponse, "description": "Internal server error"},
@@ -58,17 +56,26 @@ async def transcribe(
         default="json",
         description="Response format: 'json' for text only, 'verbose_json' for segments.",
     ),
-    _auth: None = Depends(verify_api_key),
 ) -> TranscriptionResponse | VerboseTranscriptionResponse:
     """Transcribe audio to text.
 
     OpenAI-compatible endpoint. Accepts multipart form data with an audio file.
     Supports all formats that ffmpeg can decode (wav, mp3, m4a, ogg, flac, etc.).
 
-    Rate limited per IP. Requires Bearer token if API_KEYS is configured.
+    Authentication is handled by the upstream API gateway — no Bearer token
+    validation is performed at this layer.
     """
     # Validate language
     lang = language.strip() or settings.default_language
+
+    # B-3: Pre-check Content-Length to reject oversized uploads before reading body
+    content_length = request.headers.get("Content-Length")
+    if content_length and int(content_length) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: Content-Length {content_length} exceeds "
+                    f"limit of {settings.max_upload_bytes} bytes",
+        )
 
     # Save upload to temp file
     tmp_path = await save_upload_to_temp(file)
@@ -94,7 +101,14 @@ async def transcribe(
 
         # Submit to GPU worker
         worker = request.app.state.worker
-        result = await worker.submit(audio, language=lang)
+        try:
+            result = await worker.submit(audio, language=lang)
+        except RuntimeError as exc:
+            # Worker is shutting down or not running — map to 503 (C-1)
+            raise HTTPException(
+                status_code=503,
+                detail=str(exc),
+            )
 
         # Build response
         if response_format == "verbose_json":

@@ -1,27 +1,28 @@
 # Whisper ASR API — Production Dependencies
 # Install: pip install -r requirements.txt
+#
+# Versions are pinned for reproducible deployments (B-14).
+# For hash-locked production deploys, run:
+#   pip-compile --generate-hashes requirements.in -o requirements.txt
 
 # Core
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
 
 # Whisper
-faster-whisper>=1.0.0
+faster-whisper==1.1.1
 
 # Configuration
-pydantic-settings>=2.0.0
+pydantic-settings==2.7.1
 
 # Logging
-structlog>=24.0.0
+structlog==24.4.0
 
 # Rate limiting
-slowapi>=0.1.9
+slowapi==0.1.9
 
 # Audio processing
-numpy>=1.24.0
+numpy==2.2.3
 
 # HTTP file upload
-python-multipart>=0.0.9
-
-# Async file operations
-aiofiles>=23.0.0
+python-multipart==0.0.20

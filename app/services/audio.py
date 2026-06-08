@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import structlog
 from fastapi import HTTPException, UploadFile
 
 from app.config import settings
+
+logger = structlog.get_logger(__name__)
 
 
 # --- Audio Decoding ---
@@ -177,6 +181,14 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
     temp_dir = settings.temp_dir_resolved
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    # B-3: Pre-check disk space — reject if free space < 2x max upload size
+    usage = shutil.disk_usage(str(temp_dir))
+    if usage.free < max_size * 2:
+        raise HTTPException(
+            status_code=503,
+            detail="Server disk space is critically low — please try again later",
+        )
+
     # Create a temp file with the original extension to help ffmpeg detect format
     suffix = Path(upload.filename).suffix or ".tmp"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=str(temp_dir))
@@ -187,10 +199,11 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
         with os.fdopen(fd, "wb") as f:
             while chunk := await upload.read(1024 * 1024):  # 1 MB chunks
                 total += len(chunk)
+                # B-3: Validate size BEFORE writing to disk (prevents DoS via /tmp fill)
                 if total > max_size:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"File too large: {total} bytes exceeds limit of {max_size} bytes",
+                        detail=f"File too large: exceeds limit of {max_size} bytes",
                     )
                 f.write(chunk)
 

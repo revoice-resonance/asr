@@ -21,13 +21,13 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore",
+        extra="forbid",
     )
 
     # --- Server ---
     host: str = "0.0.0.0"
     port: int = 8080
-    workers: int = 1
+    cors_origins: str = ""  # comma-separated, e.g. "https://app.example.com,https://admin.example.com"
 
     # --- Model ---
     model_path: str = "models/whisper-large-v3-turbo-ct2"
@@ -53,9 +53,6 @@ class Settings(BaseSettings):
     rate_limit_rpm: int = 60  # requests per minute, 0 = disabled
     rate_limit_burst: int = 10
 
-    # --- Authentication ---
-    api_keys: str = ""  # comma-separated
-
     # --- Logging ---
     log_level: str = "info"
     log_format: str = "json"  # "json" or "console"
@@ -68,16 +65,14 @@ class Settings(BaseSettings):
     https_proxy: str = ""
 
     @property
-    def api_keys_set(self) -> set[str]:
-        """Parse comma-separated API keys into a set."""
-        if not self.api_keys.strip():
-            return set()
-        return {k.strip() for k in self.api_keys.split(",") if k.strip()}
+    def cors_origins_list(self) -> list[str]:
+        """Parse comma-separated CORS origins into a list.
 
-    @property
-    def auth_enabled(self) -> bool:
-        """Whether API key authentication is enabled."""
-        return len(self.api_keys_set) > 0
+        Returns ["*"] if no origins are configured (allow all, credentials disabled).
+        """
+        if not self.cors_origins.strip():
+            return ["*"]
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def model_path_resolved(self) -> Path:
