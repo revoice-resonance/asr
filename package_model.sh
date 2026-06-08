@@ -6,7 +6,7 @@
 # 用法:
 #   bash package_model.sh                           # 打包默认目录
 #   bash package_model.sh -d my-model-dir            # 指定模型目录
-#   bash package_model.sh -o my-model.tar.gz         # 指定输出文件名
+#   bash package_model.sh -o my-model.tar             # 指定输出文件名
 #
 # 上传后把链接写入 MODEL_URL 文件，deploy.sh 会自动读取。
 # =============================================================================
@@ -19,7 +19,7 @@ cd "$SCRIPT_DIR"
 # --- Config -------------------------------------------------------------------
 
 MODEL_DIR="${MODEL_DIR:-whisper-large-v3-turbo-finetuned}"
-OUTPUT="${OUTPUT:-whisper-large-v3-turbo-finetuned.tar.gz}"
+OUTPUT="${OUTPUT:-whisper-large-v3-turbo-finetuned.tar}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: bash package_model.sh [-d MODEL_DIR] [-o OUTPUT.tar.gz]"
             echo ""
-            echo "  默认打包 whisper-large-v3-turbo-finetuned/ → whisper-large-v3-turbo-finetuned.tar.gz"
+            echo "  默认打包 whisper-large-v3-turbo-finetuned/ → whisper-large-v3-turbo-finetuned.tar"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -61,7 +61,7 @@ PARENT_DIR="$(dirname "$MODEL_DIR")"
 MODEL_BASENAME="$(basename "$MODEL_DIR")"
 
 log_info "打包中..."
-tar -czf "$OUTPUT" -C "$PARENT_DIR" "$MODEL_BASENAME"
+tar -cf "$OUTPUT" -C "$PARENT_DIR" "$MODEL_BASENAME"
 
 ARCHIVE_SIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
 log_info "完成: $OUTPUT ($ARCHIVE_SIZE)"

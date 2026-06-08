@@ -20,6 +20,8 @@ whisper-large-v3-turbo/
 models/
 *.safetensors
 *.bin
+*.tar
+*.tar.gz
 
 # IDE
 .idea/

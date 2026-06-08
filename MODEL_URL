@@ -1,4 +1,3 @@
-﻿# 模型下载地址 — deploy.sh 会自动读取此文件
-# 将下面这行替换为你的实际 bucket 地址:
-# https://your-bucket.example.com/models/whisper-large-v3-turbo-ct2.tar.gz
+# 模型下载地址 — deploy.sh 会自动读取此文件
+https://storage.itedev.com/revoice-resonance-models/whisper-large-v3-turbo-finetuned.tar
 

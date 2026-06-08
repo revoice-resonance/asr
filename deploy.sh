@@ -32,6 +32,15 @@ if [ -f ".env" ]; then
     set +a
 fi
 
+# Fallback: read MODEL_URL file if MODEL_DOWNLOAD_URL not set
+if [ -z "${MODEL_DOWNLOAD_URL:-}" ] && [ -f "MODEL_URL" ]; then
+    # Read first non-comment, non-empty line from MODEL_URL
+    MODEL_DOWNLOAD_URL=$(grep -v '^\s*#' MODEL_URL | grep -v '^\s*$' | head -1 | tr -d '[:space:]')
+    if [ -n "$MODEL_DOWNLOAD_URL" ]; then
+        echo "[INFO]  Read MODEL_DOWNLOAD_URL from MODEL_URL file"
+    fi
+fi
+
 # Defaults (matching .env.example)
 APP_NAME="whisper_api"
 VENV_DIR="${VENV_DIR:-venv}"
