@@ -102,26 +102,225 @@ check_prerequisites() {
     PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     log_info "Python version: $PYTHON_VERSION"
 
-    # ffmpeg
-    if ! command -v ffmpeg &>/dev/null; then
-        log_warn "ffmpeg not found. Attempting to install..."
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-        elif command -v conda &>/dev/null; then
-            conda install -y -c conda-forge ffmpeg
-        else
-            die "Cannot install ffmpeg automatically. Please install it manually."
-        fi
-    fi
-    log_info "ffmpeg: $(ffmpeg -version 2>&1 | head -1)"
-
-    # CUDA / GPU
+    # CUDA / GPU detection (must run before ffmpeg install to decide GPU vs CPU)
+    HAS_NVIDIA=false
     if command -v nvidia-smi &>/dev/null; then
+        HAS_NVIDIA=true
         log_info "GPU detected:"
         nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
     else
         log_warn "nvidia-smi not found. GPU may not be available."
     fi
+
+    # ffmpeg
+    install_ffmpeg
+
+    # Verify ffmpeg works
+    if ! ffmpeg -version &>/dev/null; then
+        die "ffmpeg installation failed. Please install it manually."
+    fi
+    log_info "ffmpeg: $(ffmpeg -version 2>&1 | head -1)"
+
+    # Report GPU acceleration status
+    if $HAS_NVIDIA; then
+        if ffmpeg -codecs 2>/dev/null | grep -q h264_nvenc; then
+            log_info "ffmpeg NVIDIA GPU acceleration: ENABLED (h264_nvenc, hevc_nvenc)"
+        else
+            log_warn "ffmpeg NVIDIA GPU acceleration: NOT available (CPU decode only)"
+        fi
+    fi
+}
+
+# --- ffmpeg Installation -------------------------------------------------------
+
+install_ffmpeg() {
+    # Already installed — check if it meets our needs
+    if command -v ffmpeg &>/dev/null; then
+        if $HAS_NVIDIA && ! ffmpeg -codecs 2>/dev/null | grep -q h264_nvenc; then
+            log_warn "ffmpeg found but lacks NVIDIA GPU codecs. Attempting upgrade..."
+            # Fall through to install GPU-enabled version
+        else
+            log_info "ffmpeg already installed with required capabilities"
+            return 0
+        fi
+    else
+        log_warn "ffmpeg not found. Installing..."
+    fi
+
+    # Strategy 1: NVIDIA GPU → download BtbN static build with NVENC/NVDEC/CUDA
+    if $HAS_NVIDIA && install_ffmpeg_nvidia; then
+        return 0
+    fi
+
+    # Strategy 2: conda (often ships GPU-enabled ffmpeg on CUDA machines)
+    if command -v conda &>/dev/null; then
+        log_info "Installing ffmpeg via conda-forge..."
+        if conda install -y -c conda-forge ffmpeg 2>/dev/null; then
+            if command -v ffmpeg &>/dev/null; then
+                log_info "ffmpeg installed via conda"
+                return 0
+            fi
+        fi
+        log_warn "conda install failed, trying next method..."
+    fi
+
+    # Strategy 3: apt-get (standard Ubuntu ffmpeg, CPU-only but reliable)
+    if command -v apt-get &>/dev/null; then
+        log_info "Installing ffmpeg via apt-get..."
+        if sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y -qq ffmpeg 2>/dev/null; then
+            if command -v ffmpeg &>/dev/null; then
+                log_info "ffmpeg installed via apt-get"
+                return 0
+            fi
+        fi
+        log_warn "apt-get install failed, trying next method..."
+    fi
+
+    # Strategy 4: static CPU-only build (last resort, works anywhere)
+    if install_ffmpeg_static; then
+        return 0
+    fi
+
+    return 1
+}
+
+install_ffmpeg_nvidia() {
+    # Download pre-built ffmpeg from BtbN/FFmpeg-Builds
+    # Includes: h264_nvenc, hevc_nvenc, h264_cuvid, hevc_cuvid, and CUDA filters
+    local BASE_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+    local ARCHIVE="ffmpeg-master-latest-linux64-gpl-shared.tar.xz"
+    local TMP_DIR="/tmp/ffmpeg_nvidia_$$"
+
+    log_info "Downloading GPU-accelerated ffmpeg (BtbN build with NVENC/NVDEC)..."
+
+    mkdir -p "$TMP_DIR"
+
+    if command -v wget &>/dev/null; then
+        wget -q --show-progress -O "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
+            log_warn "Failed to download GPU ffmpeg"
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    elif command -v curl &>/dev/null; then
+        curl -# -L -o "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
+            log_warn "Failed to download GPU ffmpeg"
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    else
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    log_info "Extracting ffmpeg..."
+    tar -xf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR" 2>/dev/null || {
+        log_warn "Failed to extract GPU ffmpeg archive"
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+
+    # Find extracted directory (name varies by build date)
+    local EXTRACTED_DIR
+    EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d -name "ffmpeg-master-*" | head -1)
+    if [ -z "$EXTRACTED_DIR" ]; then
+        log_warn "Could not find extracted ffmpeg directory"
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    # Install to /usr/local (requires sudo) or ~/.local/bin (user-local)
+    local BIN_DIR
+    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        BIN_DIR="/usr/local/bin"
+        sudo cp "${EXTRACTED_DIR}/bin/ffmpeg" "${EXTRACTED_DIR}/bin/ffprobe" "$BIN_DIR/" 2>/dev/null || {
+            BIN_DIR="${HOME}/.local/bin"
+            mkdir -p "$BIN_DIR"
+            cp "${EXTRACTED_DIR}/bin/ffmpeg" "${EXTRACTED_DIR}/bin/ffprobe" "$BIN_DIR/"
+        }
+        # Install shared libraries so ffmpeg can find them
+        sudo cp -r "${EXTRACTED_DIR}/lib/"* /usr/local/lib/ 2>/dev/null || true
+        sudo ldconfig 2>/dev/null || true
+    else
+        BIN_DIR="${HOME}/.local/bin"
+        mkdir -p "$BIN_DIR"
+        cp "${EXTRACTED_DIR}/bin/ffmpeg" "${EXTRACTED_DIR}/bin/ffprobe" "$BIN_DIR/"
+        # Add to PATH for this session
+        export PATH="${HOME}/.local/bin:${PATH}"
+        log_info "Installed ffmpeg to ${HOME}/.local/bin (add to PATH if not already)"
+    fi
+
+    # Cleanup
+    rm -rf "$TMP_DIR"
+
+    # Verify NVIDIA codecs are available
+    if command -v ffmpeg &>/dev/null && ffmpeg -codecs 2>/dev/null | grep -q h264_nvenc; then
+        log_info "GPU-accelerated ffmpeg installed successfully"
+        return 0
+    fi
+
+    log_warn "GPU ffmpeg installed but NVIDIA codecs not detected (driver mismatch?)"
+    return 1
+}
+
+install_ffmpeg_static() {
+    # Fallback: johnvansickle.com static build (CPU-only, works on any amd64 Linux)
+    local BASE_URL="https://johnvansickle.com/ffmpeg/releases"
+    local ARCHIVE="ffmpeg-release-amd64-static.tar.xz"
+    local TMP_DIR="/tmp/ffmpeg_static_$$"
+
+    log_info "Downloading static ffmpeg build (CPU-only)..."
+
+    mkdir -p "$TMP_DIR"
+
+    if command -v wget &>/dev/null; then
+        wget -q --show-progress -O "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    elif command -v curl &>/dev/null; then
+        curl -# -L -o "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    else
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    tar -xf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR" 2>/dev/null || {
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+
+    local EXTRACTED_DIR
+    EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d -name "ffmpeg-*-static" | head -1)
+    if [ -z "$EXTRACTED_DIR" ]; then
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    local BIN_DIR
+    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        BIN_DIR="/usr/local/bin"
+        sudo cp "${EXTRACTED_DIR}/ffmpeg" "${EXTRACTED_DIR}/ffprobe" "$BIN_DIR/" 2>/dev/null || {
+            BIN_DIR="${HOME}/.local/bin"
+            mkdir -p "$BIN_DIR"
+            cp "${EXTRACTED_DIR}/ffmpeg" "${EXTRACTED_DIR}/ffprobe" "$BIN_DIR/"
+        }
+    else
+        BIN_DIR="${HOME}/.local/bin"
+        mkdir -p "$BIN_DIR"
+        cp "${EXTRACTED_DIR}/ffmpeg" "${EXTRACTED_DIR}/ffprobe" "$BIN_DIR/"
+        export PATH="${HOME}/.local/bin:${PATH}"
+    fi
+
+    rm -rf "$TMP_DIR"
+
+    if command -v ffmpeg &>/dev/null; then
+        log_info "Static ffmpeg installed to ${BIN_DIR}"
+        return 0
+    fi
+    return 1
 }
 
 # --- Virtual Environment -----------------------------------------------------
