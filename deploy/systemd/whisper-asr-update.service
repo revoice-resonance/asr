@@ -1,5 +1,9 @@
 # /etc/systemd/system/whisper-asr-update.service
-# One-shot service: git pull + pip install, triggered by timer.
+# One-shot service: git pull + pip install + restart, triggered by timer.
+#
+# Runs as root so it can restart the main whisper-asr service after an update.
+# The deploy.sh update command uses sudo, which works because the service
+# already runs as root (no password needed for systemctl).
 
 [Unit]
 Description=Whisper ASR Auto-Update Check
@@ -9,17 +13,21 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=whisper
-Group=whisper
+# Run as root — needed to restart the whisper-asr service after code update.
+# Git operations preserve file ownership via deploy.sh (chown back to whisper).
+User=root
 WorkingDirectory=/opt/whisper-asr
 
 # Load environment for proxy/git config
 EnvironmentFile=-/opt/whisper-asr/.env
 
-# Run deploy.sh update — will only restart if new commits pulled
+# Run deploy.sh update — will restart the ASR service via systemctl if code changed
 ExecStart=/bin/bash /opt/whisper-asr/deploy.sh update
 
-# Sandbox hardening
+# After updating code, ensure ownership is correct for the main service
+ExecStartPost=/bin/chown -R whisper:whisper /opt/whisper-asr
+
+# Sandbox hardening (root can still write to most paths, but this is defense-in-depth)
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
