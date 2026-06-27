@@ -1,5 +1,13 @@
 # /etc/systemd/system/whisper-asr-update.timer
-# Triggers whisper-asr-update.service every AUTO_UPDATE_CHECK_INTERVAL.
+# Triggers whisper-asr-update.service periodically.
+#
+# To adjust the check interval after installation:
+#   sudo systemctl edit whisper-asr-update.timer
+#   # Add:
+#   #   [Timer]
+#   #   OnUnitActiveSec=600
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart whisper-asr-update.timer
 
 [Unit]
 Description=Whisper ASR Auto-Update Timer

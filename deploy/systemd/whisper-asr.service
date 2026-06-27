@@ -1,7 +1,10 @@
 # /etc/systemd/system/whisper-asr.service
 # Whisper ASR API — main server service
 #
-# Installation:
+# Installation (via deploy.sh):
+#   bash deploy.sh install-systemd
+#
+# Manual installation:
 #   sudo cp deploy/systemd/whisper-asr.service /etc/systemd/system/
 #   sudo cp deploy/systemd/whisper-asr-update.service /etc/systemd/system/
 #   sudo cp deploy/systemd/whisper-asr-update.timer /etc/systemd/system/
@@ -21,42 +24,45 @@ User=whisper
 Group=whisper
 WorkingDirectory=/opt/whisper-asr
 
-# Load environment from .env file
+# Load environment from .env file (systemd v240+ supports # comments)
+# The leading "-" means "ignore if file missing"
 EnvironmentFile=-/opt/whisper-asr/.env
 
 # Start via uvicorn in the venv
+# ${VAR:-default} syntax is systemd's own variable expansion from EnvironmentFile
 ExecStart=/opt/whisper-asr/venv/bin/python -m uvicorn app.main:app \
     --host ${HOST:-0.0.0.0} \
     --port ${PORT:-8080} \
     --log-level ${LOG_LEVEL:-info} \
     --workers 1
 
-# Graceful shutdown: SIGTERM, wait, then SIGKILL
-ExecStop=/bin/kill -TERM $MAINPID
+# Graceful shutdown: SIGTERM with 35s timeout before SIGKILL
 TimeoutStopSec=35
 KillMode=mixed
 KillSignal=SIGTERM
 
-# Restart policy
+# Restart policy — restart on crash, not on clean exit
 Restart=on-failure
 RestartSec=10
 
-# Resource limits for GPU
+# GPU needs memlock for CUDA
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
 
-# Logging
+# Logging to journald
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=whisper-asr
 
 # Sandbox hardening
 NoNewPrivileges=yes
-PrivateTmp=yes
+# NOTE: PrivateTmp is intentionally disabled — TEMP_DIR (from .env) is used
+# for audio temp files and must be on the shared filesystem.
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/whisper-asr/logs /opt/whisper-asr/app /tmp/whisper_api
-ReadOnlyPaths=/opt/whisper-asr/models
+# __READ_WRITE_PATHS__ is replaced by deploy.sh install-systemd at install time
+ReadWritePaths=__READ_WRITE_PATHS__
+ReadOnlyPaths=__READ_ONLY_PATHS__
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

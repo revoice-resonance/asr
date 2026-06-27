@@ -789,7 +789,74 @@ install_systemd() {
         die "Systemd unit files not found at ${SVC_DIR}"
     fi
 
-    # Copy unit files
+    # Ensure venv exists (run 'bash deploy.sh setup' first if missing)
+    if [ ! -f "${SCRIPT_DIR}/${VENV_DIR}/bin/python" ]; then
+        log_warn "Virtual environment not found. Run 'bash deploy.sh setup' first."
+        log_step "Running setup now..."
+        setup_proxy
+        check_prerequisites
+        setup_venv
+        setup_model
+    fi
+
+    # --- Create whisper system user ---
+    if ! id -u whisper &>/dev/null; then
+        log_info "Creating system user 'whisper'..."
+        sudo useradd -r -s /usr/sbin/nologin -M whisper 2>/dev/null || {
+            # Some distros use different flags; try without -M
+            sudo useradd -r -s /usr/sbin/nologin whisper 2>/dev/null || \
+            die "Failed to create 'whisper' user"
+        }
+        log_info "System user 'whisper' created"
+    else
+        log_info "User 'whisper' already exists"
+    fi
+
+    # Ensure whisper owns the install directory (so git/python can work)
+    sudo chown -R whisper:whisper "$SCRIPT_DIR"
+
+    # --- Determine writable paths from .env ---
+    local TEMP_DIR_VAL="/tmp/whisper_api"
+    local STORAGE_PATH_VAL="/data/asr_storage"
+    local LOG_DIR_VAL="${SCRIPT_DIR}/logs"
+
+    if [ -f "${SCRIPT_DIR}/.env" ]; then
+        # Source .env safely — only extract simple KEY=VALUE pairs
+        local env_temp_dir
+        env_temp_dir=$(grep -E '^TEMP_DIR=' "${SCRIPT_DIR}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || echo "")
+        [ -n "$env_temp_dir" ] && TEMP_DIR_VAL="$env_temp_dir"
+
+        local env_storage_path
+        env_storage_path=$(grep -E '^STORAGE_PATH=' "${SCRIPT_DIR}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || echo "")
+        [ -n "$env_storage_path" ] && STORAGE_PATH_VAL="$env_storage_path"
+    fi
+
+    # Ensure writable directories exist with correct ownership
+    mkdir -p "$TEMP_DIR_VAL" "$LOG_DIR_VAL"
+    sudo chown -R whisper:whisper "$TEMP_DIR_VAL" "$LOG_DIR_VAL" 2>/dev/null || true
+
+    if [ -n "$STORAGE_PATH_VAL" ]; then
+        mkdir -p "$STORAGE_PATH_VAL"
+        sudo chown -R whisper:whisper "$STORAGE_PATH_VAL" 2>/dev/null || true
+    fi
+
+    # Build ReadWritePaths (space-separated, systemd format)
+    local RW_PATHS="${LOG_DIR_VAL} ${TEMP_DIR_VAL}"
+    [ -n "$STORAGE_PATH_VAL" ] && RW_PATHS="${RW_PATHS} ${STORAGE_PATH_VAL}"
+
+    # Build ReadOnlyPaths — model dir should be read-only for defense-in-depth
+    local MODEL_PATH_FULL="${MODEL_PATH}"
+    # If MODEL_PATH is relative, make it absolute under SCRIPT_DIR
+    case "$MODEL_PATH_FULL" in
+        /*) ;;  # already absolute
+        *)  MODEL_PATH_FULL="${SCRIPT_DIR}/${MODEL_PATH_FULL}" ;;
+    esac
+    local RO_PATHS="${MODEL_PATH_FULL}"
+
+    log_info "ReadWritePaths: ${RW_PATHS}"
+    log_info "ReadOnlyPaths:  ${RO_PATHS}"
+
+    # --- Copy unit files ---
     sudo cp "${SVC_DIR}/whisper-asr.service" /etc/systemd/system/
     sudo cp "${SVC_DIR}/whisper-asr-update.service" /etc/systemd/system/
     sudo cp "${SVC_DIR}/whisper-asr-update.timer" /etc/systemd/system/
@@ -802,7 +869,13 @@ install_systemd() {
         /etc/systemd/system/whisper-asr.service \
         /etc/systemd/system/whisper-asr-update.service
 
-    # Reload and enable
+    # Replace ReadWritePaths / ReadOnlyPaths placeholders
+    sudo sed -i "s|ReadWritePaths=__READ_WRITE_PATHS__|ReadWritePaths=${RW_PATHS}|g" \
+        /etc/systemd/system/whisper-asr.service
+    sudo sed -i "s|ReadOnlyPaths=__READ_ONLY_PATHS__|ReadOnlyPaths=${RO_PATHS}|g" \
+        /etc/systemd/system/whisper-asr.service
+
+    # --- Reload and enable ---
     sudo systemctl daemon-reload
 
     log_info "Enabling whisper-asr.service..."
@@ -811,9 +884,16 @@ install_systemd() {
     log_info "Enabling whisper-asr-update.timer..."
     sudo systemctl enable whisper-asr-update.timer
 
-    log_info "Systemd units installed."
+    # --- Start services ---
+    log_info "Starting whisper-asr.service..."
+    sudo systemctl start whisper-asr.service || log_warn "Service start failed — check 'sudo journalctl -u whisper-asr -f'"
+
+    log_info "Starting whisper-asr-update.timer..."
+    sudo systemctl start whisper-asr-update.timer || log_warn "Timer start failed"
+
+    log_info "Systemd units installed and started."
     echo ""
-    echo "  Manual control:"
+    echo "  Service control:"
     echo "    sudo systemctl start whisper-asr"
     echo "    sudo systemctl stop whisper-asr"
     echo "    sudo systemctl status whisper-asr"
@@ -822,6 +902,10 @@ install_systemd() {
     echo "  Auto-update timer:"
     echo "    sudo systemctl status whisper-asr-update.timer"
     echo "    sudo systemctl list-timers whisper-asr-update"
+    echo ""
+    echo "  To change the update check interval:"
+    echo "    sudo systemctl edit whisper-asr-update.timer"
+    echo "    # Add under [Timer]: OnUnitActiveSec=600"
 }
 
 # --- Main --------------------------------------------------------------------
@@ -871,9 +955,24 @@ main() {
             do_update
             local result=$?
             if [ "$result" = "2" ]; then
+                # If running as root (e.g., from systemd update service), fix file ownership
+                # so the main service (which runs as whisper) can read updated files
+                if [ "$(id -u)" = "0" ]; then
+                    log_info "Fixing file ownership for whisper user..."
+                    chown -R whisper:whisper "$SCRIPT_DIR" 2>/dev/null || true
+                fi
+
                 # Code was updated — restart if server is running
-                if is_running; then
-                    log_info "Restarting server to apply updates..."
+                # Detect if managed by systemd and restart via systemctl
+                if command -v systemctl &>/dev/null && systemctl is-active --quiet whisper-asr 2>/dev/null; then
+                    log_info "Restarting whisper-asr via systemctl..."
+                    if [ "$(id -u)" = "0" ]; then
+                        systemctl restart whisper-asr || log_warn "systemctl restart failed"
+                    else
+                        sudo systemctl restart whisper-asr || log_warn "systemctl restart failed"
+                    fi
+                elif is_running; then
+                    log_info "Restarting server (PID-based) to apply updates..."
                     stop_server
                     sleep 2
                     start_server
@@ -882,6 +981,12 @@ main() {
             ;;
 
         auto-update)
+            # Warn if systemd is managing the service (timer handles updates)
+            if command -v systemctl &>/dev/null && systemctl is-active --quiet whisper-asr 2>/dev/null; then
+                log_warn "Systemd is managing whisper-asr. Use the timer for auto-updates:"
+                log_warn "  sudo systemctl status whisper-asr-update.timer"
+                log_warn "Starting daemon anyway (may conflict with systemd timer)..."
+            fi
             start_auto_update
             ;;
 
