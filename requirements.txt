@@ -26,3 +26,13 @@ numpy==2.2.3
 
 # HTTP file upload
 python-multipart==0.0.20
+
+# Async file I/O (non-blocking upload streaming)
+aiofiles==23.2.1
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# HTTP client (for callbacks to main backend)
+httpx==0.28.1

@@ -19,10 +19,13 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
+from app.database import close_database, get_session_factory, init_database, is_database_ready
 from app.middleware import RequestLoggingMiddleware
 from app.routes.health import router as health_router
 from app.routes.transcription import limiter, router as transcription_router
+from app.routes.corpus import router as corpus_router
 from app.services.transcriber import TranscriptionWorker
+from app.worker import TaskScheduler
 
 
 # --- Logging Setup ---
@@ -64,6 +67,7 @@ def setup_logging() -> None:
     # Silence noisy libraries
     logging.getLogger("faster_whisper").setLevel(logging.WARNING)
     logging.getLogger("ctranslate2").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
 
 
 # --- Lifespan ---
@@ -71,12 +75,23 @@ def setup_logging() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: load model on startup, cleanup on shutdown."""
+    """Application lifespan: init DB, load model, start scheduler, cleanup."""
     logger = structlog.get_logger(__name__)
 
     logger.info("Starting Whisper ASR API server")
 
-    # Verify model path exists
+    # --- Database ---
+    if settings.database_enabled:
+        logger.info(
+            "Initializing database",
+            database_url=settings.database_url.split("@")[-1] if "@" in settings.database_url else "(set)",
+        )
+        await init_database()
+        logger.info("Database connected")
+    else:
+        logger.info("Database not configured — running in stateless mode")
+
+    # --- Model ---
     model_path = settings.model_path_resolved
     if not model_path.exists():
         logger.error(
@@ -86,7 +101,6 @@ async def lifespan(app: FastAPI):
         )
         sys.exit(1)
 
-    # Initialize and start transcription worker
     worker = TranscriptionWorker()
     try:
         await worker.start()
@@ -94,25 +108,50 @@ async def lifespan(app: FastAPI):
         logger.exception("Failed to load model")
         sys.exit(1)
 
-    # Store worker on app state for route access
     app.state.worker = worker
 
+    # --- Task Scheduler (DB-backed mode only) ---
+    scheduler = None
+    if settings.database_enabled:
+        session_factory = get_session_factory()
+        if session_factory is not None:
+            scheduler = TaskScheduler(session_factory, worker)
+            await scheduler.start()
+            app.state.scheduler = scheduler
+            logger.info("Task scheduler started")
+        else:
+            logger.warning("Database configured but session factory not available")
+
+    # --- Log startup ---
     logger.info(
         "Server ready",
         host=settings.host,
         port=settings.port,
         model_path=str(model_path),
         device=settings.model_device,
+        database_enabled=settings.database_enabled,
         rate_limit=f"{settings.rate_limit_rpm}/min" if settings.rate_limit_rpm > 0 else "disabled",
-        # B-8: Dump all effective settings for debugging config typos
-        effective_settings=settings.model_dump(),
+        effective_settings=settings.model_dump(
+            exclude={"http_proxy", "https_proxy", "model_download_url", "main_backend_callback_url"}
+        ),
     )
 
     yield
 
-    # Shutdown
+    # --- Shutdown ---
     logger.info("Shutting down server")
+
+    if scheduler is not None:
+        await scheduler.stop()
+        logger.info("Task scheduler stopped")
+
     await worker.stop()
+    logger.info("GPU worker stopped")
+
+    if settings.database_enabled:
+        await close_database()
+        logger.info("Database disconnected")
+
     logger.info("Server stopped")
 
 
@@ -140,8 +179,8 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.cors_origins_list,
         allow_credentials=True if settings.cors_origins_list != ["*"] else False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"] if settings.cors_origins_list != ["*"] else ["*"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"] if settings.cors_origins_list != ["*"] else ["*"],
     )
 
     # Request logging (innermost — wraps the actual handler)
@@ -154,6 +193,7 @@ def create_app() -> FastAPI:
     # --- Routes ---
     app.include_router(health_router)
     app.include_router(transcription_router)
+    app.include_router(corpus_router)
 
     # --- Global Exception Handler ---
     @app.exception_handler(Exception)

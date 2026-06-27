@@ -52,6 +52,12 @@ async def transcribe(
         default="",
         description="Language code (e.g. 'zh', 'en'). Empty for auto-detect.",
     ),
+    temperature: float = Form(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Sampling temperature (0-1). Lower = more deterministic.",
+    ),
     response_format: Literal["json", "verbose_json"] = Form(
         default="json",
         description="Response format: 'json' for text only, 'verbose_json' for segments.",
@@ -66,16 +72,29 @@ async def transcribe(
     validation is performed at this layer.
     """
     # Validate language
-    lang = language.strip() or settings.default_language
+    lang = language.strip()
 
     # B-3: Pre-check Content-Length to reject oversized uploads before reading body
     content_length = request.headers.get("Content-Length")
-    if content_length and int(content_length) > settings.max_upload_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large: Content-Length {content_length} exceeds "
-                    f"limit of {settings.max_upload_bytes} bytes",
-        )
+    if content_length:
+        try:
+            cl = int(content_length)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Content-Length header",
+            )
+        if cl < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Content-Length must not be negative",
+            )
+        if cl > settings.max_upload_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large: Content-Length {cl} exceeds "
+                        f"limit of {settings.max_upload_bytes} bytes",
+            )
 
     # Save upload to temp file
     tmp_path = await save_upload_to_temp(file)
@@ -101,8 +120,11 @@ async def transcribe(
 
         # Submit to GPU worker
         worker = request.app.state.worker
+        client_id = request.client.host if request.client else "unknown"
         try:
-            result = await worker.submit(audio, language=lang)
+            result = await worker.submit(
+                audio, language=lang, temperature=temperature, client_id=client_id
+            )
         except RuntimeError as exc:
             # Worker is shutting down or not running — map to 503 (C-1)
             raise HTTPException(

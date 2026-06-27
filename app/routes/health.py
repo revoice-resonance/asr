@@ -35,7 +35,6 @@ async def readiness(request: Request) -> ReadyResponse:
         settings.model_device == "cpu" or
         (torch.cuda.is_available() and torch.cuda.device_count() > 0)
     )
-    queue_depth = worker.queue_depth
 
     ready = model_loaded and gpu_available
 
@@ -46,7 +45,6 @@ async def readiness(request: Request) -> ReadyResponse:
                 "status": "not_ready",
                 "model_loaded": model_loaded,
                 "gpu_available": gpu_available,
-                "queue_depth": queue_depth,
             },
         )
 
@@ -54,7 +52,6 @@ async def readiness(request: Request) -> ReadyResponse:
         status="ready",
         model_loaded=model_loaded,
         gpu_available=gpu_available,
-        queue_depth=queue_depth,
     )
 
 

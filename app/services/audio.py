@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shutil
 import subprocess
@@ -69,9 +70,10 @@ def decode_audio_ffmpeg(file_path: str | Path, sr: int = 16000) -> np.ndarray:
 
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        logger.warning("ffmpeg decode failed", stderr=stderr)
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to decode audio: {stderr or 'unknown ffmpeg error'}",
+            detail="Failed to decode audio: invalid or unsupported format",
         )
 
     if len(proc.stdout) == 0:
@@ -82,7 +84,17 @@ def decode_audio_ffmpeg(file_path: str | Path, sr: int = 16000) -> np.ndarray:
 
     # Convert s16le bytes → float32 normalized to [-1, 1]
     raw = np.frombuffer(proc.stdout, dtype=np.int16)
-    return raw.astype(np.float32) / 32768.0
+    audio = raw.astype(np.float32) / 32768.0
+
+    # Reject all-silence audio early — saves GPU inference time and gives the
+    # client a clear error instead of an empty transcription.
+    if float(np.max(np.abs(audio))) < 1e-6:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio contains only silence",
+        )
+
+    return audio
 
 
 # --- Duration Check ---
@@ -130,9 +142,10 @@ def get_audio_duration(file_path: str | Path) -> float:
 
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        logger.warning("ffprobe duration check failed", stderr=stderr)
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to probe audio: {stderr or 'unknown ffprobe error'}",
+            detail="Failed to probe audio: invalid or unsupported format",
         )
 
     try:
@@ -143,7 +156,9 @@ def get_audio_duration(file_path: str | Path) -> float:
             detail="Could not determine audio duration",
         )
 
-    if duration <= 0:
+    # math.isnan/math.isinf: NaN <= 0 is False in Python, so NaN would otherwise
+    # bypass the guard below. Inf would pass it. Reject both explicitly.
+    if math.isnan(duration) or math.isinf(duration) or duration <= 0:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid audio duration: {duration:.2f}s",
@@ -189,14 +204,23 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
             detail="Server disk space is critically low — please try again later",
         )
 
-    # Create a temp file with the original extension to help ffmpeg detect format
+    # Create a temp file with the original extension to help ffmpeg detect format.
+    # Truncate suffix to a sane length (a pathological extension can exceed the
+    # platform path limit and crash mkstemp with an unhandled error).
     suffix = Path(upload.filename).suffix or ".tmp"
-    fd, tmp_path = tempfile.mkstemp(suffix=suffix, dir=str(temp_dir))
-    tmp_path = Path(tmp_path)
+    if len(suffix) > 32:
+        suffix = suffix[:32]
+    tmp_file = tempfile.NamedTemporaryFile(
+        suffix=suffix, dir=str(temp_dir), delete=False
+    )
+    tmp_path = Path(tmp_file.name)
+    tmp_file.close()  # closed so aiofiles can reopen it for async writes
 
     try:
+        import aiofiles
+
         total = 0
-        with os.fdopen(fd, "wb") as f:
+        async with aiofiles.open(tmp_path, "wb") as f:
             while chunk := await upload.read(1024 * 1024):  # 1 MB chunks
                 total += len(chunk)
                 # B-3: Validate size BEFORE writing to disk (prevents DoS via /tmp fill)
@@ -205,7 +229,7 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
                         status_code=413,
                         detail=f"File too large: exceeds limit of {max_size} bytes",
                     )
-                f.write(chunk)
+                await f.write(chunk)
 
         if total == 0:
             raise HTTPException(
@@ -218,12 +242,13 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
         if tmp_path.exists():
             tmp_path.unlink()
         raise
-    except Exception as e:
+    except Exception:
         if tmp_path.exists():
             tmp_path.unlink()
+        logger.exception("Failed to save uploaded file")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to save uploaded file: {e}",
+            detail="Failed to save uploaded file. Please try again.",
         )
 
     return tmp_path

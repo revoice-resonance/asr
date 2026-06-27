@@ -10,6 +10,7 @@ Single GPU worker pattern:
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -24,6 +25,18 @@ from app.config import settings
 logger = structlog.get_logger(__name__)
 
 
+def _safe_float(value: float, default: float = 0.0) -> float:
+    """Coerce a float to a finite value, replacing NaN/Inf with a default.
+
+    faster-whisper can emit NaN/Inf segment fields with corrupted models or
+    certain cuDNN versions; such values produce invalid JSON (RFC 8259) and
+    break client parsers. Sanitize at the source rather than at serialization.
+    """
+    if value is None or math.isnan(value) or math.isinf(value):
+        return default
+    return value
+
+
 @dataclass
 class TranscriptionJob:
     """A single transcription job in the queue."""
@@ -31,6 +44,8 @@ class TranscriptionJob:
     audio: np.ndarray
     language: str
     future: asyncio.Future
+    temperature: float = 0.0
+    client_id: str = "unknown"
 
 
 @dataclass
@@ -61,6 +76,18 @@ class TranscriptionWorker:
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
         self._model_loaded = False
+        # Per-client fairness: cap in-flight jobs per client so one client cannot
+        # saturate the single-GPU queue with max-duration audio (DoS).
+        self._active_jobs_per_client: dict[str, int] = {}
+        self._max_jobs_per_client: int = max(1, settings.rate_limit_burst)
+
+    def _decrement_client(self, client_id: str) -> None:
+        """Release one in-flight slot for a client. Called via future callback."""
+        active = self._active_jobs_per_client.get(client_id, 0)
+        if active <= 1:
+            self._active_jobs_per_client.pop(client_id, None)
+        else:
+            self._active_jobs_per_client[client_id] = active - 1
 
     # --- Lifecycle ---
 
@@ -136,12 +163,16 @@ class TranscriptionWorker:
         self,
         audio: np.ndarray,
         language: str = "",
+        temperature: float = 0.0,
+        client_id: str = "unknown",
     ) -> TranscriptionResult:
         """Submit an audio array for transcription.
 
         Args:
             audio: Float32 numpy array of 16kHz mono audio.
             language: Language code (e.g. "zh", "en") or "" for auto-detect.
+            temperature: Sampling temperature (0-1).
+            client_id: Identifier (typically client IP) for per-client fairness.
 
         Returns:
             TranscriptionResult with text, language, duration, and segments.
@@ -153,13 +184,47 @@ class TranscriptionWorker:
         if not self._running:
             raise RuntimeError("Transcription worker is not running")
 
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
-        job = TranscriptionJob(audio=audio, language=language, future=future)
+        # Defense-in-depth: validate audio array size against max_audio_duration.
+        # ffprobe reads container metadata which can be spoofed; this guards the
+        # memory held by TranscriptionJob while waiting in the queue.
+        max_audio_bytes = settings.max_audio_duration * 16000 * 4  # 16kHz float32
+        if audio.nbytes > max_audio_bytes * 2:  # 2x safety margin
+            raise ValueError(
+                f"Audio array too large: {audio.nbytes} bytes exceeds limit "
+                f"of {max_audio_bytes * 2} bytes"
+            )
+
+        # Per-client fairness: reject if this client already has too many jobs
+        # in-flight, so one client cannot monopolize the single-GPU queue.
+        active = self._active_jobs_per_client.get(client_id, 0)
+        if active >= self._max_jobs_per_client:
+            raise RuntimeError(
+                f"Too many concurrent jobs from this client ({active}). "
+                "Please wait for existing jobs to complete."
+            )
+
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        job = TranscriptionJob(
+            audio=audio,
+            language=language,
+            future=future,
+            temperature=temperature,
+            client_id=client_id,
+        )
+
+        # Reserve a slot now; release it when the future settles (resolved,
+        # failed, cancelled, or rejected on shutdown) via a done callback.
+        self._active_jobs_per_client[client_id] = active + 1
+        future.add_done_callback(
+            lambda _f, cid=client_id: self._decrement_client(cid)
+        )
 
         # Put in queue with timeout
         try:
             await asyncio.wait_for(self._queue.put(job), timeout=30.0)
         except asyncio.TimeoutError:
+            # Never queued — undo the reservation we just made.
+            self._decrement_client(client_id)
             raise RuntimeError(
                 f"Transcription queue is full (depth={self._queue.qsize()}). "
                 "Try again later."
@@ -204,7 +269,9 @@ class TranscriptionWorker:
 
                 try:
                     start = time.monotonic()
-                    result = await self._transcribe(job.audio, job.language)
+                    result = await self._transcribe(
+                        job.audio, job.language, job.temperature
+                    )
                     elapsed = time.monotonic() - start
 
                     logger.info(
@@ -243,12 +310,14 @@ class TranscriptionWorker:
         self,
         audio: np.ndarray,
         language: str,
+        temperature: float = 0.0,
     ) -> TranscriptionResult:
         """Run faster-whisper transcription in a thread.
 
         Args:
             audio: Float32 numpy array of 16kHz mono audio.
             language: Language code or "" for auto-detect.
+            temperature: Sampling temperature (0-1).
 
         Returns:
             TranscriptionResult.
@@ -256,8 +325,9 @@ class TranscriptionWorker:
         if self._model is None:
             raise RuntimeError("Model not loaded")
 
-        # Resolve language
-        lang = language or settings.default_language or None
+        # Resolve language: if explicitly empty, try default; if default also empty, use None for auto-detect
+        _lang = language.strip() if language else ""
+        lang = _lang if _lang else (settings.default_language or None)
 
         # Run inference in a thread to avoid blocking the event loop
         segments, info = await asyncio.to_thread(
@@ -267,7 +337,10 @@ class TranscriptionWorker:
             task="transcribe",
             beam_size=5,
             best_of=5,
-            temperature=[0.0, 0.2, 0.4],
+            temperature=(
+                [temperature, min(temperature + 0.2, 1.0), min(temperature + 0.4, 1.0)]
+                if temperature < 1.0 else [temperature]
+            ),
             vad_filter=settings.vad_enabled,
             vad_parameters=dict(
                 threshold=settings.vad_threshold,
@@ -283,19 +356,21 @@ class TranscriptionWorker:
         full_text_parts: list[str] = []
 
         for seg in segments:
+            # Sanitize float fields: NaN/Inf would produce invalid JSON and
+            # break clients. Replace with sensible defaults.
             segment_list.append({
                 "id": seg.id,
                 "seek": seg.seek,
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "text": seg.text.strip(),
+                "start": round(_safe_float(seg.start, 0.0), 2),
+                "end": round(_safe_float(seg.end, 0.0), 2),
+                "text": seg.text,
                 "tokens": seg.tokens,
-                "temperature": round(seg.temperature, 2),
-                "avg_logprob": round(seg.avg_logprob, 4),
-                "compression_ratio": round(seg.compression_ratio, 4),
-                "no_speech_prob": round(seg.no_speech_prob, 4),
+                "temperature": round(_safe_float(seg.temperature, 0.0), 2),
+                "avg_logprob": round(_safe_float(seg.avg_logprob, 0.0), 4),
+                "compression_ratio": round(_safe_float(seg.compression_ratio, 0.0), 4),
+                "no_speech_prob": round(_safe_float(seg.no_speech_prob, 1.0), 4),
             })
-            full_text_parts.append(seg.text.strip())
+            full_text_parts.append(seg.text)
 
         # GPU cleanup after each job
         if settings.model_device == "cuda" and torch.cuda.is_available():
@@ -304,6 +379,6 @@ class TranscriptionWorker:
         return TranscriptionResult(
             text="".join(full_text_parts),
             language=info.language,
-            duration=round(info.duration, 2),
+            duration=round(_safe_float(info.duration, 0.0), 2),
             segments=segment_list,
         )
