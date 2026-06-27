@@ -15,6 +15,9 @@
 #   bash deploy.sh status         # Check server status
 #   bash deploy.sh logs [N]       # Tail last N lines of logs (default 50)
 #   bash deploy.sh setup          # Install deps + download model (no start)
+#   bash deploy.sh update         # Git pull + pip install + restart
+#   bash deploy.sh auto-update    # Start background auto-update daemon
+#   bash deploy.sh auto-update-stop # Stop the auto-update daemon
 # =============================================================================
 
 set -euo pipefail
@@ -37,6 +40,11 @@ if [ -z "${MODEL_DOWNLOAD_URL:-}" ] && [ -f "MODEL_URL" ]; then
     # Read first non-comment, non-empty line from MODEL_URL
     MODEL_DOWNLOAD_URL=$(grep -v '^\s*#' MODEL_URL | grep -v '^\s*$' | head -1 | tr -d '[:space:]')
     if [ -n "$MODEL_DOWNLOAD_URL" ]; then
+        # Validate URL starts with https://
+        if [[ "$MODEL_DOWNLOAD_URL" != https://* ]]; then
+            echo "[ERROR] MODEL_URL must start with https://, got: $MODEL_DOWNLOAD_URL"
+            exit 1
+        fi
         echo "[INFO]  Read MODEL_DOWNLOAD_URL from MODEL_URL file"
     fi
 fi
@@ -45,8 +53,11 @@ fi
 APP_NAME="whisper_api"
 VENV_DIR="${VENV_DIR:-venv}"
 PID_FILE="${PID_FILE:-${APP_NAME}.pid}"
+AUTO_UPDATE_PID_FILE="${AUTO_UPDATE_PID_FILE:-${APP_NAME}_auto_update.pid}"
 LOG_DIR="${LOG_DIR:-logs}"
 LOG_FILE="${LOG_DIR}/${APP_NAME}.log"
+AUTO_UPDATE_LOG="${LOG_DIR}/auto_update.log"
+AUTO_UPDATE_INTERVAL="${AUTO_UPDATE_INTERVAL:-300}"  # seconds between checks (default 5 min)
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
@@ -186,8 +197,10 @@ install_ffmpeg() {
 install_ffmpeg_nvidia() {
     # Download pre-built ffmpeg from BtbN/FFmpeg-Builds
     # Includes: h264_nvenc, hevc_nvenc, h264_cuvid, hevc_cuvid, and CUDA filters
-    local BASE_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+    local BASE_URL="${FFMPEG_BASE_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest}"
     local ARCHIVE="ffmpeg-master-latest-linux64-gpl-shared.tar.xz"
+    # Optional: set FFMPEG_SHA256 to verify the downloaded archive (supply-chain hardening).
+    local EXPECTED_SHA256="${FFMPEG_SHA256:-}"
     local TMP_DIR="/tmp/ffmpeg_nvidia_$$"
 
     log_info "Downloading GPU-accelerated ffmpeg (BtbN build with NVENC/NVDEC)..."
@@ -211,8 +224,25 @@ install_ffmpeg_nvidia() {
         return 1
     fi
 
+    # Verify checksum if one was provided (defense against MITM / swapped release)
+    if [ -n "$EXPECTED_SHA256" ] && command -v sha256sum &>/dev/null; then
+        local actual_sha
+        actual_sha=$(sha256sum "${TMP_DIR}/${ARCHIVE}" | cut -d' ' -f1)
+        if [ "$actual_sha" != "$EXPECTED_SHA256" ]; then
+            log_error "ffmpeg archive checksum mismatch — possible tampering"
+            log_error "  expected: $EXPECTED_SHA256"
+            log_error "  actual:   $actual_sha"
+            rm -rf "$TMP_DIR"
+            return 1
+        fi
+        log_info "ffmpeg archive checksum verified"
+    elif [ -n "$EXPECTED_SHA256" ]; then
+        log_warn "FFMPEG_SHA256 set but sha256sum not available — skipping verification"
+    fi
+
     log_info "Extracting ffmpeg..."
-    tar -xf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR" 2>/dev/null || {
+    tar -xf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR" \
+        --no-same-owner --no-same-permissions 2>/dev/null || {
         log_warn "Failed to extract GPU ffmpeg archive"
         rm -rf "$TMP_DIR"
         return 1
@@ -322,10 +352,20 @@ setup_model() {
 
         log_info "Extracting model..."
         mkdir -p "$MODEL_PATH"
-        tar -xzf "$ARCHIVE" -C "$MODEL_PATH" --strip-components=1 2>/dev/null || \
-            tar -xzf "$ARCHIVE" -C "$MODEL_PATH" 2>/dev/null || \
+        tar -xzf "$ARCHIVE" -C "$MODEL_PATH" --strip-components=1 \
+            --no-same-owner --no-same-permissions 2>/dev/null || \
+            tar -xzf "$ARCHIVE" -C "$MODEL_PATH" \
+            --no-same-owner --no-same-permissions 2>/dev/null || \
             unzip -q "$ARCHIVE" -d "$MODEL_PATH" 2>/dev/null || \
             die "Failed to extract model archive"
+
+        # Verify extraction did not escape MODEL_PATH (defense-in-depth)
+        if find "$MODEL_PATH" -maxdepth 1 \( -name "..*" -o -path "/*" \) 2>/dev/null | grep -q .; then
+            log_error "Model archive contains suspicious paths — aborting"
+            rm -rf "$MODEL_PATH"
+            rm -f "$ARCHIVE"
+            exit 1
+        fi
 
         rm -f "$ARCHIVE"
         log_info "Model downloaded and extracted to $MODEL_PATH"
@@ -407,6 +447,20 @@ is_running() {
         local pid
         pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            # Guard against PID recycling: verify the process is actually our
+            # uvicorn server, not an unrelated process that reused the PID.
+            if [ -r "/proc/$pid/cmdline" ]; then
+                local cmdline
+                cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+                case "$cmdline" in
+                    *uvicorn*|*app.main*) return 0 ;;
+                    *)
+                        log_warn "PID $pid in $PID_FILE is not the Whisper server (recycled?) — ignoring"
+                        rm -f "$PID_FILE"
+                        return 1
+                        ;;
+                esac
+            fi
             return 0
         fi
     fi
@@ -438,6 +492,7 @@ start_server() {
         --host "$HOST" \
         --port "$PORT" \
         --log-level "$LOG_LEVEL" \
+        # Single worker to avoid loading multiple model copies into GPU (O(n) VRAM)
         --workers 1 \
         >> "$LOG_FILE" 2>&1 &
 
@@ -450,7 +505,7 @@ start_server() {
     local max_wait=60
     while [ $waited -lt $max_wait ]; do
         if command -v curl &>/dev/null; then
-            if curl -sf "http://${HOST}:${PORT}/health/ready" >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:${PORT}/health/ready" >/dev/null 2>&1; then
                 break
             fi
         fi
@@ -537,6 +592,187 @@ show_logs() {
     fi
 }
 
+# --- Update ------------------------------------------------------------------
+
+GIT_REMOTE="${GIT_REMOTE:-origin}"
+GIT_BRANCH="${GIT_BRANCH:-master}"
+# Repo URL for git clone if not already a git repo
+GIT_CLONE_URL="${GIT_CLONE_URL:-https://github.com/revoice-resonance/asr.git}"
+
+do_update() {
+    log_step "Checking for updates from ${GIT_REMOTE}/${GIT_BRANCH}..."
+
+    # Ensure we're in a git repo
+    if ! git rev-parse --git-dir &>/dev/null; then
+        log_warn "Not a git repository — skipping git operations"
+        return 1
+    fi
+
+    # Stash any local changes so pull is clean (saves them for inspection)
+    local stashed=false
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+        log_info "Local changes detected — stashing before update"
+        git stash push -m "auto-update stash $(date -Iseconds)" 2>/dev/null || true
+        stashed=true
+    fi
+
+    # Fetch latest
+    if ! git fetch "$GIT_REMOTE" "$GIT_BRANCH" 2>/dev/null; then
+        log_error "git fetch failed — check network or GIT_REMOTE/GIT_BRANCH"
+        return 1
+    fi
+
+    LOCAL=$(git rev-parse HEAD 2>/dev/null || echo "")
+    REMOTE=$(git rev-parse "${GIT_REMOTE}/${GIT_BRANCH}" 2>/dev/null || echo "")
+
+    if [ -z "$LOCAL" ] || [ -z "$REMOTE" ]; then
+        log_error "Could not determine local or remote HEAD"
+        return 1
+    fi
+
+    if [ "$LOCAL" = "$REMOTE" ]; then
+        log_info "Already up-to-date (${LOCAL:0:8})"
+        if $stashed; then
+            log_info "Restoring stashed local changes"
+            git stash pop 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    # Show what's new
+    log_info "Updates available — new commits:"
+    git log --oneline "${LOCAL}..${REMOTE}" 2>/dev/null || true
+    echo ""
+
+    # Pull
+    if ! git pull "$GIT_REMOTE" "$GIT_BRANCH" 2>/dev/null; then
+        log_error "git pull failed"
+        return 1
+    fi
+
+    log_info "Code updated to ${REMOTE:0:8}"
+
+    # Update Python dependencies
+    log_step "Updating Python dependencies..."
+    source "$VENV_DIR/bin/activate" 2>/dev/null || source "$VENV_DIR/Scripts/activate" 2>/dev/null
+    pip install -r requirements.txt -q 2>/dev/null || log_warn "pip install had warnings"
+
+    if $stashed; then
+        log_info "Attempting to re-apply stashed local changes (may conflict)..."
+        git stash pop 2>/dev/null || log_warn "Stash pop had conflicts — local changes in working tree"
+    fi
+
+    log_info "Update complete"
+    return 2  # Return 2 means "updated" (caller can decide to restart)
+}
+
+# --- Auto-Update Daemon -----------------------------------------------------
+
+auto_update_is_running() {
+    if [ -f "$AUTO_UPDATE_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$AUTO_UPDATE_PID_FILE" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+auto_update_daemon() {
+    # The actual daemon loop — runs in background via nohup
+    log_info "Auto-update daemon started (PID: $$, interval: ${AUTO_UPDATE_INTERVAL}s)"
+    log_info "Auto-update log: $AUTO_UPDATE_LOG"
+
+    while true; do
+        sleep "$AUTO_UPDATE_INTERVAL"
+
+        echo "[$(date -Iseconds)] Checking for updates..." >> "$AUTO_UPDATE_LOG"
+
+        # Capture update output
+        local result=0
+        do_update >> "$AUTO_UPDATE_LOG" 2>&1 || result=$?
+
+        if [ "$result" = "2" ]; then
+            # Code was updated — restart the server
+            echo "[$(date -Iseconds)] Update applied, restarting server..." >> "$AUTO_UPDATE_LOG"
+            if is_running; then
+                # Source env for restart
+                setup_proxy >> "$AUTO_UPDATE_LOG" 2>&1 || true
+                source "$VENV_DIR/bin/activate" 2>/dev/null || source "$VENV_DIR/Scripts/activate" 2>/dev/null
+                stop_server >> "$AUTO_UPDATE_LOG" 2>&1 || true
+                sleep 2
+                start_server >> "$AUTO_UPDATE_LOG" 2>&1 || {
+                    echo "[$(date -Iseconds)] [ERROR] Server restart failed!" >> "$AUTO_UPDATE_LOG"
+                }
+                echo "[$(date -Iseconds)] Server restarted" >> "$AUTO_UPDATE_LOG"
+            fi
+        fi
+
+        # Rotate auto-update log if > 1MB
+        if [ -f "$AUTO_UPDATE_LOG" ]; then
+            local logsize
+            logsize=$(stat -c%s "$AUTO_UPDATE_LOG" 2>/dev/null || stat -f%z "$AUTO_UPDATE_LOG" 2>/dev/null || echo 0)
+            if [ "$logsize" -gt 1048576 ] 2>/dev/null; then
+                mv "$AUTO_UPDATE_LOG" "${AUTO_UPDATE_LOG}.old" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
+start_auto_update() {
+    if auto_update_is_running; then
+        local pid
+        pid=$(cat "$AUTO_UPDATE_PID_FILE")
+        log_warn "Auto-update daemon is already running (PID: $pid)"
+        return 1
+    fi
+
+    log_step "Starting auto-update daemon (interval: ${AUTO_UPDATE_INTERVAL}s)..."
+
+    # Activate venv if it exists (so git/python/pip are available)
+    if [ -d "$VENV_DIR" ]; then
+        source "$VENV_DIR/bin/activate" 2>/dev/null || source "$VENV_DIR/Scripts/activate" 2>/dev/null
+    fi
+
+    mkdir -p "$LOG_DIR"
+
+    # Start daemon in background
+    nohup bash "$0" _auto_update_daemon >> "$AUTO_UPDATE_LOG" 2>&1 &
+
+    local pid=$!
+    echo "$pid" > "$AUTO_UPDATE_PID_FILE"
+
+    if kill -0 "$pid" 2>/dev/null; then
+        log_info "Auto-update daemon started (PID: $pid)"
+        log_info "  Check interval: ${AUTO_UPDATE_INTERVAL}s"
+        log_info "  Log file:       $AUTO_UPDATE_LOG"
+    else
+        log_error "Auto-update daemon failed to start"
+        rm -f "$AUTO_UPDATE_PID_FILE"
+        return 1
+    fi
+}
+
+stop_auto_update() {
+    if ! auto_update_is_running; then
+        log_warn "Auto-update daemon is not running"
+        rm -f "$AUTO_UPDATE_PID_FILE"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$AUTO_UPDATE_PID_FILE")
+    log_step "Stopping auto-update daemon (PID: $pid)..."
+
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null || true
+
+    rm -f "$AUTO_UPDATE_PID_FILE"
+    log_info "Auto-update daemon stopped"
+}
+
 # --- Main --------------------------------------------------------------------
 
 main() {
@@ -566,6 +802,8 @@ main() {
         restart)
             stop_server
             sleep 2
+            # Re-export proxy vars in case they were lost after stop
+            setup_proxy
             start_server
             ;;
 
@@ -577,18 +815,54 @@ main() {
             show_logs "${2:-50}"
             ;;
 
+        update)
+            setup_proxy
+            do_update
+            local result=$?
+            if [ "$result" = "2" ]; then
+                # Code was updated — restart if server is running
+                if is_running; then
+                    log_info "Restarting server to apply updates..."
+                    stop_server
+                    sleep 2
+                    start_server
+                fi
+            fi
+            ;;
+
+        auto-update)
+            start_auto_update
+            ;;
+
+        auto-update-stop)
+            stop_auto_update
+            ;;
+
+        _auto_update_daemon)
+            # Internal: called by nohup to run the daemon loop
+            auto_update_daemon
+            ;;
+
         *)
             echo "Whisper ASR API — Deployment Script"
             echo ""
             echo "Usage: bash deploy.sh <command> [options]"
             echo ""
             echo "Commands:"
-            echo "  setup      Install dependencies and download model (don't start)"
-            echo "  start      Start the server (setup + start)"
-            echo "  stop       Stop the server gracefully"
-            echo "  restart    Stop then start the server"
-            echo "  status     Show server status and health"
-            echo "  logs [N]   Tail last N lines of logs (default: 50)"
+            echo "  setup             Install dependencies and download model (don't start)"
+            echo "  start             Start the server (setup + start)"
+            echo "  stop              Stop the server gracefully"
+            echo "  restart           Stop then start the server"
+            echo "  status            Show server status and health"
+            echo "  logs [N]          Tail last N lines of logs (default: 50)"
+            echo "  update            Git pull + pip install + restart (if running)"
+            echo "  auto-update       Start background auto-update daemon"
+            echo "  auto-update-stop  Stop the auto-update daemon"
+            echo ""
+            echo "Auto-update config (.env or export):"
+            echo "  AUTO_UPDATE_INTERVAL  Seconds between checks (default: 300 = 5 min)"
+            echo "  GIT_REMOTE            Git remote name (default: origin)"
+            echo "  GIT_BRANCH            Git branch to track (default: master)"
             echo ""
             echo "Environment (.env or export):"
             echo "  MODEL_DOWNLOAD_URL   URL to download model archive"
