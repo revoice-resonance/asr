@@ -1,0 +1,65 @@
+# /etc/systemd/system/whisper-asr.service
+# Whisper ASR API — main server service
+#
+# Installation:
+#   sudo cp deploy/systemd/whisper-asr.service /etc/systemd/system/
+#   sudo cp deploy/systemd/whisper-asr-update.service /etc/systemd/system/
+#   sudo cp deploy/systemd/whisper-asr-update.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now whisper-asr.service
+#   sudo systemctl enable --now whisper-asr-update.timer
+
+[Unit]
+Description=Whisper ASR API Server
+Documentation=https://github.com/revoice-resonance/asr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whisper
+Group=whisper
+WorkingDirectory=/opt/whisper-asr
+
+# Load environment from .env file
+EnvironmentFile=-/opt/whisper-asr/.env
+
+# Start via uvicorn in the venv
+ExecStart=/opt/whisper-asr/venv/bin/python -m uvicorn app.main:app \
+    --host ${HOST:-0.0.0.0} \
+    --port ${PORT:-8080} \
+    --log-level ${LOG_LEVEL:-info} \
+    --workers 1
+
+# Graceful shutdown: SIGTERM, wait, then SIGKILL
+ExecStop=/bin/kill -TERM $MAINPID
+TimeoutStopSec=35
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+
+# Resource limits for GPU
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whisper-asr
+
+# Sandbox hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/whisper-asr/logs /opt/whisper-asr/app /tmp/whisper_api
+ReadOnlyPaths=/opt/whisper-asr/models
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

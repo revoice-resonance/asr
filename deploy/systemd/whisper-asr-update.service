@@ -1,0 +1,30 @@
+# /etc/systemd/system/whisper-asr-update.service
+# One-shot service: git pull + pip install, triggered by timer.
+
+[Unit]
+Description=Whisper ASR Auto-Update Check
+Documentation=https://github.com/revoice-resonance/asr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=whisper
+Group=whisper
+WorkingDirectory=/opt/whisper-asr
+
+# Load environment for proxy/git config
+EnvironmentFile=-/opt/whisper-asr/.env
+
+# Run deploy.sh update — will only restart if new commits pulled
+ExecStart=/bin/bash /opt/whisper-asr/deploy.sh update
+
+# Sandbox hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/whisper-asr
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes

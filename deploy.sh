@@ -18,6 +18,7 @@
 #   bash deploy.sh update         # Git pull + pip install + restart
 #   bash deploy.sh auto-update    # Start background auto-update daemon
 #   bash deploy.sh auto-update-stop # Stop the auto-update daemon
+#   bash deploy.sh install-systemd # Install systemd service + timer units
 # =============================================================================
 
 set -euo pipefail
@@ -773,6 +774,56 @@ stop_auto_update() {
     log_info "Auto-update daemon stopped"
 }
 
+# --- Systemd Installation ---------------------------------------------------
+
+install_systemd() {
+    log_step "Installing systemd service units..."
+
+    if ! command -v systemctl &>/dev/null; then
+        die "systemctl not found — systemd is required"
+    fi
+
+    local SVC_DIR="${SCRIPT_DIR}/deploy/systemd"
+
+    if [ ! -f "${SVC_DIR}/whisper-asr.service" ]; then
+        die "Systemd unit files not found at ${SVC_DIR}"
+    fi
+
+    # Copy unit files
+    sudo cp "${SVC_DIR}/whisper-asr.service" /etc/systemd/system/
+    sudo cp "${SVC_DIR}/whisper-asr-update.service" /etc/systemd/system/
+    sudo cp "${SVC_DIR}/whisper-asr-update.timer" /etc/systemd/system/
+
+    # Replace placeholder paths in service files with actual install path
+    sudo sed -i "s|WorkingDirectory=/opt/whisper-asr|WorkingDirectory=${SCRIPT_DIR}|g" \
+        /etc/systemd/system/whisper-asr.service \
+        /etc/systemd/system/whisper-asr-update.service
+    sudo sed -i "s|/opt/whisper-asr|${SCRIPT_DIR}|g" \
+        /etc/systemd/system/whisper-asr.service \
+        /etc/systemd/system/whisper-asr-update.service
+
+    # Reload and enable
+    sudo systemctl daemon-reload
+
+    log_info "Enabling whisper-asr.service..."
+    sudo systemctl enable whisper-asr.service
+
+    log_info "Enabling whisper-asr-update.timer..."
+    sudo systemctl enable whisper-asr-update.timer
+
+    log_info "Systemd units installed."
+    echo ""
+    echo "  Manual control:"
+    echo "    sudo systemctl start whisper-asr"
+    echo "    sudo systemctl stop whisper-asr"
+    echo "    sudo systemctl status whisper-asr"
+    echo "    sudo journalctl -u whisper-asr -f"
+    echo ""
+    echo "  Auto-update timer:"
+    echo "    sudo systemctl status whisper-asr-update.timer"
+    echo "    sudo systemctl list-timers whisper-asr-update"
+}
+
 # --- Main --------------------------------------------------------------------
 
 main() {
@@ -838,6 +889,10 @@ main() {
             stop_auto_update
             ;;
 
+        install-systemd)
+            install_systemd
+            ;;
+
         _auto_update_daemon)
             # Internal: called by nohup to run the daemon loop
             auto_update_daemon
@@ -858,6 +913,7 @@ main() {
             echo "  update            Git pull + pip install + restart (if running)"
             echo "  auto-update       Start background auto-update daemon"
             echo "  auto-update-stop  Stop the auto-update daemon"
+            echo "  install-systemd   Install systemd service + timer units (requires sudo)"
             echo ""
             echo "Auto-update config (.env or export):"
             echo "  AUTO_UPDATE_INTERVAL  Seconds between checks (default: 300 = 5 min)"

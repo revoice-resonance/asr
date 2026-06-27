@@ -1,0 +1,19 @@
+# /etc/systemd/system/whisper-asr-update.timer
+# Triggers whisper-asr-update.service every AUTO_UPDATE_CHECK_INTERVAL.
+
+[Unit]
+Description=Whisper ASR Auto-Update Timer
+Documentation=https://github.com/revoice-resonance/asr
+Requires=whisper-asr-update.service
+
+[Timer]
+# Check for updates every 5 minutes, with 30s randomized delay to avoid
+# thundering herd against GitHub
+OnUnitActiveSec=300
+RandomizedDelaySec=30
+
+# If a check was missed (e.g., server was down), run immediately on boot
+Persistent=true
+
+[Install]
+WantedBy=timers.target
