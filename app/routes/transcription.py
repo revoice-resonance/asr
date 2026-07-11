@@ -16,12 +16,7 @@ from app.schemas.responses import (
     TranscriptionSegment,
     VerboseTranscriptionResponse,
 )
-from app.services.audio import (
-    cleanup_temp_file,
-    decode_audio_ffmpeg_async,
-    get_audio_duration_async,
-    save_upload_to_temp,
-)
+from app.services.upload_pipeline import process_upload, validate_content_length
 
 logger = structlog.get_logger(__name__)
 
@@ -74,90 +69,49 @@ async def transcribe(
     # Validate language
     lang = language.strip()
 
-    # B-3: Pre-check Content-Length to reject oversized uploads before reading body
-    content_length = request.headers.get("Content-Length")
-    if content_length:
-        try:
-            cl = int(content_length)
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid Content-Length header",
-            )
-        if cl < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Content-Length must not be negative",
-            )
-        if cl > settings.max_upload_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large: Content-Length {cl} exceeds "
-                        f"limit of {settings.max_upload_bytes} bytes",
-            )
+    # Pre-check Content-Length before reading body
+    validate_content_length(request)
 
-    # Save upload to temp file
-    tmp_path = await save_upload_to_temp(file)
+    # Process upload through pipeline
+    decoded = await process_upload(file)
+    audio = decoded.audio
 
+    # Submit to GPU worker
+    worker = request.app.state.worker
+    client_id = request.client.host if request.client else "unknown"
     try:
-        # Check audio duration (non-blocking via asyncio.to_thread)
-        duration = await get_audio_duration_async(tmp_path)
-        if duration > settings.max_audio_duration:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Audio too long: {duration:.1f}s exceeds limit of "
-                        f"{settings.max_audio_duration}s",
-            )
+        result = await worker.submit(
+            audio, language=lang, temperature=temperature, client_id=client_id
+        )
+    except RuntimeError as exc:
+        # Worker is shutting down or not running — map to 503 (C-1)
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        )
 
-        if duration < 0.1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Audio too short: {duration:.2f}s",
+    # Build response
+    if response_format == "verbose_json":
+        segments = [
+            TranscriptionSegment(
+                id=seg["id"],
+                seek=seg["seek"],
+                start=seg["start"],
+                end=seg["end"],
+                text=seg["text"],
+                tokens=seg["tokens"],
+                temperature=seg["temperature"],
+                avg_logprob=seg["avg_logprob"],
+                compression_ratio=seg["compression_ratio"],
+                no_speech_prob=seg["no_speech_prob"],
             )
-
-        # Decode to numpy array (non-blocking via asyncio.to_thread)
-        audio = await decode_audio_ffmpeg_async(tmp_path)
-
-        # Submit to GPU worker
-        worker = request.app.state.worker
-        client_id = request.client.host if request.client else "unknown"
-        try:
-            result = await worker.submit(
-                audio, language=lang, temperature=temperature, client_id=client_id
-            )
-        except RuntimeError as exc:
-            # Worker is shutting down or not running — map to 503 (C-1)
-            raise HTTPException(
-                status_code=503,
-                detail=str(exc),
-            )
-
-        # Build response
-        if response_format == "verbose_json":
-            segments = [
-                TranscriptionSegment(
-                    id=seg["id"],
-                    seek=seg["seek"],
-                    start=seg["start"],
-                    end=seg["end"],
-                    text=seg["text"],
-                    tokens=seg["tokens"],
-                    temperature=seg["temperature"],
-                    avg_logprob=seg["avg_logprob"],
-                    compression_ratio=seg["compression_ratio"],
-                    no_speech_prob=seg["no_speech_prob"],
-                )
-                for seg in result.segments
-            ]
-            return VerboseTranscriptionResponse(
-                text=result.text,
-                language=result.language,
-                duration=result.duration,
-                segments=segments,
-            )
-        else:
-            return TranscriptionResponse(text=result.text)
-
-    finally:
-        # Always clean up temp file
-        cleanup_temp_file(tmp_path)
+            for seg in result.segments
+        ]
+        return VerboseTranscriptionResponse(
+            text=result.text,
+            language=result.language,
+            duration=result.duration,
+            segments=segments,
+        )
+    else:
+        return TranscriptionResponse(text=result.text)

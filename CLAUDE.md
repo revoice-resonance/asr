@@ -206,8 +206,16 @@ Tests run without GPU/DB — ffmpeg and GPU calls are mocked or use monkeypatche
 - `numpy`, `python-multipart`, `aiofiles`
 - `ffmpeg` / `ffprobe` (system-level, for audio decode)
 
-## Git Conventions
+## Agent skills
 
-- Model files are **never** committed (`.gitignore` excludes `models/`, `*.safetensors`, `*.bin`)
-- `.env` is gitignored; `.env.example` is committed as a template
-- Upstream: `https://github.com/revoice-resonance/asr.git`
+### Issue tracker
+
+GitHub Issues (`gh` CLI). External PRs are a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` + `docs/adr/` at repo root. See `docs/agents/domain.md`.

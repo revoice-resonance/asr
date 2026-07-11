@@ -101,7 +101,7 @@ async def lifespan(app: FastAPI):
         )
         sys.exit(1)
 
-    worker = TranscriptionWorker()
+    worker = TranscriptionWorker(settings=settings)
     try:
         await worker.start()
     except Exception:
@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI):
     if settings.database_enabled:
         session_factory = get_session_factory()
         if session_factory is not None:
-            scheduler = TaskScheduler(session_factory, worker)
+            scheduler = TaskScheduler(session_factory, worker, settings=settings)
             await scheduler.start()
             app.state.scheduler = scheduler
             logger.info("Task scheduler started")

@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import structlog
 
-from app.config import settings
+from app.config import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -19,6 +19,9 @@ async def notify_main_backend(
     result_text: str | None = None,
     confidence: float | None = None,
     error_message: str | None = None,
+    callback_url: str | None = None,
+    max_retries: int | None = None,
+    retry_base_delay: float | None = None,
 ) -> bool:
     """POST task completion result to the main backend with exponential retry.
 
@@ -29,11 +32,19 @@ async def notify_main_backend(
         result_text: Transcription result text (if SUCCESS).
         confidence: Overall confidence score (if SUCCESS).
         error_message: Error description (if FAILED).
+        callback_url: Override settings.main_backend_callback_url.
+        max_retries: Override settings.callback_max_retries.
+        retry_base_delay: Override settings.callback_retry_base_delay.
 
     Returns:
         True if the callback succeeded, False after exhausting all retries.
     """
-    if not settings.main_backend_callback_url.strip():
+    _defaults = Settings.resolve(None)
+    _url = callback_url if callback_url is not None else _defaults.main_backend_callback_url
+    _max_retries = max_retries if max_retries is not None else _defaults.callback_max_retries
+    _base_delay = retry_base_delay if retry_base_delay is not None else _defaults.callback_retry_base_delay
+
+    if not _url.strip():
         logger.debug("No callback URL configured, skipping")
         return True  # not a failure — callback is optional
 
@@ -48,16 +59,13 @@ async def notify_main_backend(
     elif status == "FAILED":
         payload["error_message"] = error_message
 
-    max_retries = settings.callback_max_retries
-    base_delay = settings.callback_retry_base_delay
-
     last_exc: Exception | None = None
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for attempt in range(max_retries + 1):
+        for attempt in range(_max_retries + 1):
             try:
                 response = await client.post(
-                    settings.main_backend_callback_url,
+                    _url,
                     json=payload,
                 )
                 if response.status_code < 500:
@@ -79,13 +87,13 @@ async def notify_main_backend(
             except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
                 last_exc = exc
 
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
+            if attempt < _max_retries:
+                delay = _base_delay * (2 ** attempt)
                 logger.warning(
                     "Callback attempt failed, retrying",
                     task_id=task_id,
                     attempt=attempt + 1,
-                    max_retries=max_retries,
+                    max_retries=_max_retries,
                     delay=delay,
                     error=str(last_exc),
                 )
@@ -94,7 +102,7 @@ async def notify_main_backend(
     logger.error(
         "Callback exhausted all retries",
         task_id=task_id,
-        max_retries=max_retries,
+        max_retries=_max_retries,
         last_error=str(last_exc),
     )
     return False

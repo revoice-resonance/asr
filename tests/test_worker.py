@@ -50,7 +50,7 @@ class TestWorkerShutdown:
         worker._worker_task = asyncio.create_task(asyncio.sleep(0))
 
         # Submit a job — it will sit in the queue since worker is "busy"
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         from app.services.transcriber import TranscriptionJob
         job = TranscriptionJob(audio=dummy_audio, language="zh", future=future)
         await worker._queue.put(job)
@@ -70,7 +70,7 @@ class TestWorkerShutdown:
         monkeypatch.setattr(worker, "_running", True)
 
         # Create a future that will be cancelled
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
 
         # Bypass the queue put and directly set up the future
         original_put = worker._queue.put

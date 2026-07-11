@@ -30,8 +30,8 @@ class TestDecodeAudioFfmpeg:
         # Create mock subprocess that returns valid s16le data
         mock_proc = mock.MagicMock()
         mock_proc.returncode = 0
-        # 100 samples of silence as s16le
-        mock_proc.stdout = b"\x00\x00" * 100
+        # 100 non-zero samples (int16 value 256) so silence check passes
+        mock_proc.stdout = b"\x00\x01" * 100
 
         monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_proc)
 
@@ -39,6 +39,19 @@ class TestDecodeAudioFfmpeg:
         assert isinstance(result, np.ndarray)
         assert result.dtype == np.float32
         assert len(result) == 100
+
+    def test_decode_rejects_silence(self, monkeypatch):
+        """All-silence audio should be rejected with 400."""
+        mock_proc = mock.MagicMock()
+        mock_proc.returncode = 0
+        # 100 samples of silence as s16le
+        mock_proc.stdout = b"\x00\x00" * 100
+        monkeypatch.setattr("subprocess.run", lambda *a, **kw: mock_proc)
+
+        with pytest.raises(HTTPException) as exc_info:
+            decode_audio_ffmpeg("/fake/path.wav")
+        assert exc_info.value.status_code == 400
+        assert "silence" in exc_info.value.detail.lower()
 
     def test_decode_ffmpeg_not_found(self, monkeypatch):
         """Should raise 500 when ffmpeg is not installed."""

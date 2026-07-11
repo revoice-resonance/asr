@@ -21,11 +21,8 @@ from app.schemas.responses import (
     RecognizeResponse,
     TaskListResponse,
 )
-from app.services.audio import (
-    cleanup_temp_file,
-    get_audio_duration_async,
-    save_upload_to_temp,
-)
+from app.services.audio import cleanup_temp_file
+from app.services.upload_pipeline import process_upload, validate_content_length
 from app.services.corpus import (
     compute_md5,
     create_corpus,
@@ -126,27 +123,21 @@ async def upload_corpus(
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
-    # Validate Content-Length
-    content_length = request.headers.get("Content-Length")
-    if content_length:
-        try:
-            cl = int(content_length)
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid Content-Length header")
-        if cl < 0:
-            raise HTTPException(status_code=400, detail="Content-Length must not be negative")
-        if cl > settings.max_upload_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large: {cl} exceeds limit of {settings.max_upload_bytes} bytes",
-            )
+    # Pre-check Content-Length before reading body
+    validate_content_length(request)
 
-    # Save upload to temp
-    tmp_path = await save_upload_to_temp(file)
+    # Save upload to temp, probe duration, and decode (keep temp file for storage)
+    try:
+        decoded = await process_upload(file, cleanup=False)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Upload processing failed")
+        raise HTTPException(status_code=500, detail="Failed to process audio upload")
 
     try:
         # Compute MD5
-        md5 = await compute_md5(tmp_path)
+        md5 = await compute_md5(decoded.temp_path)
 
         # Dedup check
         existing = await find_corpus_by_md5(db, md5)
@@ -154,7 +145,7 @@ async def upload_corpus(
             # Check for an existing successful task
             cached_task = await find_successful_task(db, existing.id)
             if cached_task is not None:
-                cleanup_temp_file(tmp_path)
+                cleanup_temp_file(decoded.temp_path)
                 await db.commit()
                 logger.info("Dedup hit — returning cached result", corpus_id=existing.id, md5=md5)
                 return RecognizeResponse(
@@ -170,25 +161,14 @@ async def upload_corpus(
             corpus = existing
             logger.info("Dedup hit but no success — creating retry task", corpus_id=corpus.id, md5=md5)
         else:
-            # New file — get audio metadata
-            duration_sec = await get_audio_duration_async(tmp_path)
-            if duration_sec > settings.max_audio_duration:
-                cleanup_temp_file(tmp_path)
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Audio too long: {duration_sec:.1f}s exceeds {settings.max_audio_duration}s",
-                )
-            if duration_sec < 0.1:
-                cleanup_temp_file(tmp_path)
-                raise HTTPException(status_code=400, detail=f"Audio too short: {duration_sec:.2f}s")
-
-            duration_ms = int(duration_sec * 1000)
+            # New file — use duration from process_upload
+            duration_ms = int(decoded.duration * 1000)
 
             # Store file in permanent storage
             storage_dir = settings.storage_path_resolved
             storage_dir.mkdir(parents=True, exist_ok=True)
-            dest_file_name = f"{md5}{tmp_path.suffix}"
-            dest_path = await store_file(tmp_path, storage_dir, dest_file_name)
+            dest_file_name = f"{md5}{decoded.temp_path.suffix}"
+            dest_path = await store_file(decoded.temp_path, storage_dir, dest_file_name)
 
             file_size = dest_path.stat().st_size
 
@@ -237,7 +217,7 @@ async def upload_corpus(
 
     finally:
         # Clean up temp file only if it still exists (may have been moved)
-        cleanup_temp_file(tmp_path)
+        cleanup_temp_file(decoded.temp_path)
 
 
 @router.get(

@@ -152,6 +152,16 @@ class Settings(BaseSettings):
         """Whether database integration is configured."""
         return bool(self.database_url.strip())
 
+    @classmethod
+    def resolve(cls, settings: Settings | None) -> Settings:
+        """Return the given settings instance or the default singleton.
 
-# Singleton
-settings = Settings()
+        Use this to accept optional settings in constructors:
+            self._settings = Settings.resolve(settings)
+        """
+        return settings if settings is not None else _settings_singleton
+
+
+# Singleton — use Settings.resolve() instead of importing this directly
+_settings_singleton = Settings()
+settings = _settings_singleton  # backward-compatible alias

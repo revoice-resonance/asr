@@ -14,7 +14,7 @@ import numpy as np
 import structlog
 from fastapi import HTTPException, UploadFile
 
-from app.config import settings
+from app.config import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -170,12 +170,13 @@ def get_audio_duration(file_path: str | Path) -> float:
 # --- Upload Handling ---
 
 
-async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -> Path:
+async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None, temp_dir: Path | None = None) -> Path:
     """Stream an uploaded file to a temporary location with size limiting.
 
     Args:
         upload: FastAPI UploadFile object.
         max_size: Maximum allowed size in bytes. Defaults to settings.max_upload_bytes.
+        temp_dir: Directory to save the temp file. Defaults to settings.temp_dir_resolved.
 
     Returns:
         Path to the saved temporary file.
@@ -184,7 +185,7 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
         HTTPException: If the upload exceeds max_size or has no filename.
     """
     if max_size is None:
-        max_size = settings.max_upload_bytes
+        max_size = Settings.resolve(None).max_upload_bytes
 
     if not upload.filename:
         raise HTTPException(
@@ -193,11 +194,11 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
         )
 
     # Ensure temp directory exists
-    temp_dir = settings.temp_dir_resolved
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    resolved_dir = temp_dir if temp_dir is not None else Settings.resolve(None).temp_dir_resolved
+    resolved_dir.mkdir(parents=True, exist_ok=True)
 
     # B-3: Pre-check disk space — reject if free space < 2x max upload size
-    usage = shutil.disk_usage(str(temp_dir))
+    usage = shutil.disk_usage(str(resolved_dir))
     if usage.free < max_size * 2:
         raise HTTPException(
             status_code=503,
@@ -211,7 +212,7 @@ async def save_upload_to_temp(upload: UploadFile, max_size: int | None = None) -
     if len(suffix) > 32:
         suffix = suffix[:32]
     tmp_file = tempfile.NamedTemporaryFile(
-        suffix=suffix, dir=str(temp_dir), delete=False
+        suffix=suffix, dir=str(resolved_dir), delete=False
     )
     tmp_path = Path(tmp_file.name)
     tmp_file.close()  # closed so aiofiles can reopen it for async writes

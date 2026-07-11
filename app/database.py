@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.config import settings
+from app.config import Settings
 
 # Module-level singletons (initialized at startup)
 _engine: AsyncEngine | None = None
@@ -35,12 +35,14 @@ async def init_database(
     """
     global _engine, _session_factory
 
-    url = url or settings.database_url
+    _defaults = Settings.resolve(None)
+
+    url = url or _defaults.database_url
     if not url.strip():
         return
 
-    pool_size = pool_size or settings.database_pool_size
-    pool_overflow = pool_overflow or settings.database_pool_overflow
+    pool_size = pool_size or _defaults.database_pool_size
+    pool_overflow = pool_overflow or _defaults.database_pool_overflow
 
     _engine = create_async_engine(
         url,

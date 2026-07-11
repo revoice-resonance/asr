@@ -20,7 +20,7 @@ import structlog
 import torch
 from faster_whisper import WhisperModel
 
-from app.config import settings
+from app.config import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -57,6 +57,17 @@ class TranscriptionResult:
     duration: float
     segments: list[dict]
 
+    @property
+    def confidence(self) -> float | None:
+        """Average confidence across all segments, computed from avg_logprob."""
+        if not self.segments:
+            return None
+        logprobs = [s.get("avg_logprob", 0.0) for s in self.segments]
+        logprobs = [lp for lp in logprobs if lp != 0.0]
+        if not logprobs:
+            return None
+        return round(sum(logprobs) / len(logprobs), 4)
+
 
 class TranscriptionWorker:
     """Manages the faster-whisper model and GPU worker queue.
@@ -68,10 +79,11 @@ class TranscriptionWorker:
         await worker.stop()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = Settings.resolve(settings)
         self._model: Optional[WhisperModel] = None
         self._queue: asyncio.Queue[TranscriptionJob] = asyncio.Queue(
-            maxsize=settings.rate_limit_burst * 2 or 20
+            maxsize=self._settings.rate_limit_burst * 2 or 20
         )
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
@@ -79,7 +91,7 @@ class TranscriptionWorker:
         # Per-client fairness: cap in-flight jobs per client so one client cannot
         # saturate the single-GPU queue with max-duration audio (DoS).
         self._active_jobs_per_client: dict[str, int] = {}
-        self._max_jobs_per_client: int = max(1, settings.rate_limit_burst)
+        self._max_jobs_per_client: int = max(1, self._settings.rate_limit_burst)
 
     def _decrement_client(self, client_id: str) -> None:
         """Release one in-flight slot for a client. Called via future callback."""
@@ -98,20 +110,20 @@ class TranscriptionWorker:
 
         logger.info(
             "Loading faster-whisper model",
-            model_path=settings.model_path,
-            device=settings.model_device,
-            compute_type=settings.model_compute_type,
+            model_path=self._settings.model_path,
+            device=self._settings.model_device,
+            compute_type=self._settings.model_compute_type,
         )
 
-        model_path = str(settings.model_path_resolved)
+        model_path = str(self._settings.model_path_resolved)
 
         # Load model in a thread to avoid blocking the event loop
         self._model = await asyncio.to_thread(
             WhisperModel,
             model_path,
-            device=settings.model_device,
-            device_index=settings.model_device_index,
-            compute_type=settings.model_compute_type,
+            device=self._settings.model_device,
+            device_index=self._settings.model_device_index,
+            compute_type=self._settings.model_compute_type,
             cpu_threads=4,
             num_workers=1,
         )
@@ -151,7 +163,7 @@ class TranscriptionWorker:
             del self._model
             self._model = None
 
-        if settings.model_device == "cuda" and torch.cuda.is_available():
+        if self._settings.model_device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         self._model_loaded = False
@@ -187,7 +199,7 @@ class TranscriptionWorker:
         # Defense-in-depth: validate audio array size against max_audio_duration.
         # ffprobe reads container metadata which can be spoofed; this guards the
         # memory held by TranscriptionJob while waiting in the queue.
-        max_audio_bytes = settings.max_audio_duration * 16000 * 4  # 16kHz float32
+        max_audio_bytes = self._settings.max_audio_duration * 16000 * 4  # 16kHz float32
         if audio.nbytes > max_audio_bytes * 2:  # 2x safety margin
             raise ValueError(
                 f"Audio array too large: {audio.nbytes} bytes exceeds limit "
@@ -327,7 +339,7 @@ class TranscriptionWorker:
 
         # Resolve language: if explicitly empty, try default; if default also empty, use None for auto-detect
         _lang = language.strip() if language else ""
-        lang = _lang if _lang else (settings.default_language or None)
+        lang = _lang if _lang else (self._settings.default_language or None)
 
         # Run inference in a thread to avoid blocking the event loop
         segments, info = await asyncio.to_thread(
@@ -341,11 +353,11 @@ class TranscriptionWorker:
                 [temperature, min(temperature + 0.2, 1.0), min(temperature + 0.4, 1.0)]
                 if temperature < 1.0 else [temperature]
             ),
-            vad_filter=settings.vad_enabled,
+            vad_filter=self._settings.vad_enabled,
             vad_parameters=dict(
-                threshold=settings.vad_threshold,
-                min_silence_duration_ms=settings.vad_min_silence_duration_ms,
-            ) if settings.vad_enabled else None,
+                threshold=self._settings.vad_threshold,
+                min_silence_duration_ms=self._settings.vad_min_silence_duration_ms,
+            ) if self._settings.vad_enabled else None,
             condition_on_previous_text=True,
             no_speech_threshold=0.6,
             word_timestamps=False,
@@ -373,7 +385,7 @@ class TranscriptionWorker:
             full_text_parts.append(seg.text)
 
         # GPU cleanup after each job
-        if settings.model_device == "cuda" and torch.cuda.is_available():
+        if self._settings.model_device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         return TranscriptionResult(
