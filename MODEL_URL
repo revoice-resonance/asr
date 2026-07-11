@@ -1,3 +1,3 @@
-# 模型下载地址 — deploy.sh 会自动读取此文件
+# 模型下载地址 — deploy.sh 会自动读取此文件 https://huggingface.co/revoice-resonance/asr
 https://storage.itedev.com/revoice-resonance-models/whisper-large-v3-turbo-finetuned.tar
 
